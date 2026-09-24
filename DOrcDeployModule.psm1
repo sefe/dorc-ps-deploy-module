@@ -50,12 +50,22 @@ function Invoke-CommandWithRetry {
         [string] $ComputerName,
         [Parameter(Mandatory = $true)]
         [scriptblock] $ScriptBlock,
+        [object[]] $ArgumentList,
         [int] $RetryCount = 5,
         [int] $RetryDelaySeconds = 5
     )
+    $invokeParams = @{
+        ComputerName = $ComputerName
+        ScriptBlock  = $ScriptBlock
+        ErrorAction  = 'Stop'
+    }
+    # Invoke-Command rejects an explicit $null for -ArgumentList, so only pass it when supplied
+    if ($PSBoundParameters.ContainsKey('ArgumentList')) { $invokeParams.ArgumentList = $ArgumentList }
     for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
         try {
-            return Invoke-Command -ComputerName $ComputerName -ScriptBlock $ScriptBlock -ErrorAction Stop
+            $result = Invoke-Command @invokeParams
+            Write-Host "    Invoke-Command to $ComputerName is successfull"
+            return $result
         }
         catch {
             Write-Host "    Invoke-Command to $ComputerName failed (attempt $attempt of $RetryCount): $($_.Exception.Message)"
@@ -210,12 +220,12 @@ function Remove-MsiProductByCode([string] $strComputerName, $Product) {
         return $false
     }
     try {
-        $exitCode = Invoke-Command -ComputerName $strComputerName -ScriptBlock {
+        $exitCode = Invoke-CommandWithRetry -ComputerName $strComputerName -ScriptBlock {
             param($code)
             $ErrorActionPreference = 'Stop'
             $p = Start-Process -FilePath "msiexec.exe" -ArgumentList "/x", $code, "/qn", "/norestart" -Wait -PassThru
             return $p.ExitCode
-        } -ArgumentList $Product.ProductCode -ErrorAction Stop
+        } -ArgumentList $Product.ProductCode
     }
     catch {
         Write-Host "          Remote uninstall failed for" $Product.Name "-" $_.Exception.Message
