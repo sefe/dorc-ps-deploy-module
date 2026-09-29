@@ -37,6 +37,43 @@ function Format-ParameterForLogging {
         return "$paramName=$maskedValue"
     }
 }
+
+<#
+.SYNOPSIS
+    TEMPORARY FIX: retries Invoke-Command against a single computer to work around
+    intermittent WSMan "could not launch a host process" errors until root cause is found.
+#>
+function Invoke-CommandWithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ComputerName,
+        [Parameter(Mandatory = $true)]
+        [scriptblock] $ScriptBlock,
+        [object[]] $ArgumentList,
+        [int] $RetryCount = 5,
+        [int] $RetryDelaySeconds = 5
+    )
+    $invokeParams = @{
+        ComputerName = $ComputerName
+        ScriptBlock  = $ScriptBlock
+        ErrorAction  = 'Stop'
+    }
+    # Invoke-Command rejects an explicit $null for -ArgumentList, so only pass it when supplied
+    if ($PSBoundParameters.ContainsKey('ArgumentList')) { $invokeParams.ArgumentList = $ArgumentList }
+    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+        try {
+            $result = Invoke-Command @invokeParams
+            Write-Host "    Invoke-Command to $ComputerName is successfull"
+            return $result
+        }
+        catch {
+            Write-Host "    Invoke-Command to $ComputerName failed (attempt $attempt of $RetryCount): $($_.Exception.Message)"
+            if ($attempt -eq $RetryCount) { throw }
+            Start-Sleep -Seconds $RetryDelaySeconds
+        }
+    }
+}
 #endregion
 
 
@@ -183,12 +220,12 @@ function Remove-MsiProductByCode([string] $strComputerName, $Product) {
         return $false
     }
     try {
-        $exitCode = Invoke-Command -ComputerName $strComputerName -ScriptBlock {
+        $exitCode = Invoke-CommandWithRetry -ComputerName $strComputerName -ScriptBlock {
             param($code)
             $ErrorActionPreference = 'Stop'
             $p = Start-Process -FilePath "msiexec.exe" -ArgumentList "/x", $code, "/qn", "/norestart" -Wait -PassThru
             return $p.ExitCode
-        } -ArgumentList $Product.ProductCode -ErrorAction Stop
+        } -ArgumentList $Product.ProductCode
     }
     catch {
         Write-Host "          Remote uninstall failed for" $Product.Name "-" $_.Exception.Message
@@ -294,7 +331,7 @@ function UninstallProduct([string] $strComputerName, [string] $strMSIFullName) {
  
     $bolReturn = $false
     $strMSIName = $strMSIFullName.SubString(($strMSIFullName.LastIndexOf("\") + 1), ($strMSIFullName.Length - ($strMSIFullName.LastIndexOf("\") + 1)))
-    $DestFolderCollection = Invoke-Command -ComputerName $strComputerName { Get-Item env:TEMP }
+    $DestFolderCollection = Invoke-CommandWithRetry -ComputerName $strComputerName -ScriptBlock { Get-Item env:TEMP }
     $LocalMSI = Join-Path $DestFolderCollection.Value $strMSIName
     $DestFolder = Join-Path \\$strComputerName $DestFolderCollection.Value
     $DestFolder = $DestFolder -replace ":", "$"
@@ -394,7 +431,7 @@ function UninstallProduct([string] $strComputerName, [string] $strMSIFullName) {
 function InstallMSI([string] $strComputerName, [string] $strMSIFullName, $arrParameters) {
     $bolReturn = $false
     $strMSIName = $strMSIFullName.SubString(($strMSIFullName.LastIndexOf("\") + 1), ($strMSIFullName.Length - ($strMSIFullName.LastIndexOf("\") + 1)))
-    $DestFolderCollection = Invoke-Command -ComputerName $strComputerName { Get-Item env:TEMP }
+    $DestFolderCollection = Invoke-CommandWithRetry -ComputerName $strComputerName -ScriptBlock { Get-Item env:TEMP }
     $LocalMSI = Join-Path $DestFolderCollection.Value $strMSIName
     $DestFolder = Join-Path \\$strComputerName $DestFolderCollection.Value
     $DestFolder = $DestFolder -replace ":", "$"
