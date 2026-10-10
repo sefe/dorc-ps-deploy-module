@@ -3076,29 +3076,75 @@ function Install-WindowsFeaturesDorc
 function Apply-DatabasePermissions 
 (
     [Parameter(Position = 0, Mandatory = $true)] [string] $instance,
-    [Parameter(Position = 1, Mandatory = $true)] [string] $database
+    [Parameter(Position = 1, Mandatory = $true)] [string] $database,
+    [ValidateSet('Legacy', 'DatabaseAccess')]
+    [string] $permissionSource = $(if ($DatabasePermissionsMode) { $DatabasePermissionsMode } else { 'Legacy' }),
+    [string] $environment = $EnvironmentName,
+    [switch] $previewOnly
 )
 {
-        write-host ""
-        write-host "[Apply-DatabasePermissions] Processing:" $instance"."$database
-        $strStatus = GetDBStatus $instance $database 
-        if ($strStatus -eq "Normal") {
-            Write-Host "[Apply-DatabasePermissions] Processing:" $instance"."$database "is" $strStatus
-            $outputFolder = $DBPermsOutput + "\" + (GetDateReverse) + "-" + $instance.Replace("\", "_") + "." + $database
-            Write-Host "[Apply-DatabasePermissions] Output folder:" $outputFolder
-            Get-DBPermissions -server $instance -database $database -outputFilepath $outputFolder
-            if ((Test-Path $outputFolder -PathType Container) -and ((Get-Childitem $outputFolder -Recurse -File -Filter *.sql | Measure-Object | ForEach-Object{$_.Count}) -gt 0)) {
-                write-host "[Apply-DatabasePermissions] Permissions extract does exist...:" $instance"."$database
-                write-host "[Apply-DatabasePermissions] Applying permissions to:" $instance"."$database                
-                write-host "[Apply-DatabasePermissions] Using:" $ApplyPermissionsExePath
-                $args = "/instance:$instance /database:$database /prod:$IsProd"
-                $tmpOutput = New-TemporaryFile
-                start-process -FilePath $ApplyPermissionsExePath -ArgumentList $args -RedirectStandardOutput $tmpOutput -Wait
-                $permsOutput = Get-Content -Path $tmpOutput
-                foreach ($line in $permsOutput) { write-host "[Apply-DatabasePermissions]" $line}
-                Remove-Item $tmpOutput.FullName -Force
-            } else { write-host "[Apply-DatabasePermissions] SQL extract has not succeeded to permissions will not be reset..." }
-        } else { write-host "[Apply-DatabasePermissions] Database is not in the normal state..." }
+    if ($permissionSource -notin @('Legacy', 'DatabaseAccess')) {
+        throw "DatabasePermissionsMode must be Legacy or DatabaseAccess."
+    }
+    if ($previewOnly -and $permissionSource -ne 'DatabaseAccess') {
+        throw "PreviewOnly is supported only with DatabaseAccess; refusing to run legacy permissions."
+    }
+    $production = $false
+    if (-not [bool]::TryParse([string]$IsProd, [ref]$production)) {
+        throw "IsProd must be configured as true or false."
+    }
+    $exe = Get-Item -LiteralPath $ApplyPermissionsExePath -ErrorAction Stop
+    $cliArgs = @("/instance:$instance", "/database:$database", "/prod:$production")
+    if ($permissionSource -eq 'DatabaseAccess') {
+        # Old CLIs ignore unknown switches and could otherwise run a legacy reset.
+        if ($exe.VersionInfo.Comments -ne 'DOrc.DatabaseAccess/1') {
+            throw "DatabaseAccess requires the updated generic Tools.ApplyPermissionsCLI. The configured executable does not support its protocol."
+        }
+        if ([string]::IsNullOrWhiteSpace($environment) -or [string]::IsNullOrWhiteSpace($RefDataApiUrl)) {
+            throw "DatabaseAccess requires EnvironmentName and RefDataApiUrl."
+        }
+        $cliArgs += @('/permissions:DatabaseAccess', "/environment:$environment", "/apiurl:$RefDataApiUrl", "/preview:$($previewOnly.IsPresent)")
+    }
+
+    Write-Host "[Apply-DatabasePermissions] $permissionSource for $instance.$database"
+    if (-not $previewOnly) {
+        $strStatus = GetDBStatus $instance $database
+        if ($strStatus -ne 'Normal') {
+            throw "Database $instance.$database is not in the normal state ($strStatus)."
+        }
+        $outputFolder = $DBPermsOutput + "\" + (GetDateReverse) + "-" + $instance.Replace("\", "_") + "." + $database
+        Get-DBPermissions -server $instance -database $database -outputFilepath $outputFolder -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath $outputFolder -PathType Container) -or
+            @(Get-ChildItem -LiteralPath $outputFolder -Recurse -File -Filter '*.sql' -ErrorAction Stop).Count -eq 0) {
+            throw "Permissions extract failed for $instance.$database; permissions were not applied."
+        }
+    }
+
+    $arguments = ($cliArgs | ForEach-Object {
+        '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+    }) -join ' '
+    $tmpOutput = $null
+    $tmpError = $null
+    try {
+        $tmpOutput = New-TemporaryFile -ErrorAction Stop
+        $tmpError = New-TemporaryFile -ErrorAction Stop
+        $process = Start-Process -FilePath $exe.FullName -ArgumentList $arguments `
+            -WorkingDirectory $exe.DirectoryName -RedirectStandardOutput $tmpOutput.FullName `
+            -RedirectStandardError $tmpError.FullName -Wait -PassThru -ErrorAction Stop
+        Get-Content -LiteralPath $tmpOutput.FullName -ErrorAction Stop | ForEach-Object {
+            Write-Host "[Apply-DatabasePermissions] $_"
+        }
+        Get-Content -LiteralPath $tmpError.FullName -ErrorAction Stop | ForEach-Object {
+            Write-Host "[Apply-DatabasePermissions] stderr: $_"
+        }
+        if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) {
+            throw "Applying database permissions failed with exit code $($process.ExitCode). No fallback was attempted."
+        }
+    }
+    finally {
+        if ($null -ne $tmpOutput) { Remove-Item -LiteralPath $tmpOutput.FullName -Force -ErrorAction Stop }
+        if ($null -ne $tmpError) { Remove-Item -LiteralPath $tmpError.FullName -Force -ErrorAction Stop }
+    }
 }
 
 function Check-ProductInstalledReg

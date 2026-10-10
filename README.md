@@ -30,6 +30,42 @@ Examples of commonly used functions include:
 - `Get-AzAccessTokenToResource`
 - `Get-DorcToken`
 
+## Database permission modes
+
+`Apply-DatabasePermissions` defaults to the existing legacy CLI behavior. For a
+migrated SQL-only database, deploy the updated generic `Tools.ApplyPermissionsCLI`
+from `dorc-cli`, then opt in explicitly:
+
+```powershell
+Apply-DatabasePermissions -instance 'SQL-SERVER\DEV' -database 'ApplicationDB' `
+    -permissionSource DatabaseAccess -environment 'BB Labs 01' -previewOnly
+```
+
+Remove `-previewOnly` to apply a fresh API preview. Set the environment deployment
+property `DatabasePermissionsMode=DatabaseAccess` to opt existing callers (including
+post-restore calls) into this mode without editing each script. Leave it unset or
+`Legacy` for legacy deployments. Do not use the legacy reset on migrated databases.
+
+The module forwards `EnvironmentName`, `RefDataApiUrl` and `IsProd`, quotes arguments,
+checks the CLI's embedded `DOrc.DatabaseAccess/1` capability marker before running
+it, captures stdout/stderr and throws on nonzero exit codes. An older or
+Endur/Arc/ComOps-specific executable is rejected in DatabaseAccess mode; those
+tools also manage application accounts, which the new SQL-only API does not.
+There is no fallback from DatabaseAccess to legacy.
+
+Both apply modes still require a successful permissions backup and a database in
+the normal state. Preview skips the backup/legacy SQL connection and never applies.
+Backup failure, an abnormal database state, or a failed CLI now stops the deployment
+rather than allowing subsequent restore steps to continue.
+
+The DatabaseAccess schema/API (including machine-to-machine audit identity support)
+must be deployed first. The API database allowlist and independent execution switch
+remain authoritative. The CLI authenticates using its configured OAuth client or
+Windows identity; target SQL operations use the **API service identity**. Configure
+API service-account SQL permissions and trusted certificates before enabling apply.
+Production applies remain additive-only. Review/import desired state before moving
+an environment to the new mode; no automatic legacy import is performed.
+
 ## Build and publish workflows
 
 The repository includes GitHub Actions workflows:

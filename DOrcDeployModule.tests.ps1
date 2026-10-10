@@ -3,6 +3,100 @@ BeforeAll {
     Import-Module "$here\DOrcDeployModule.psm1" -Force -ErrorAction Stop
 }
 
+Describe "Apply-DatabasePermissions integration" {
+    BeforeAll {
+        InModuleScope DOrcDeployModule {
+            function script:Get-DBPermissions {
+                [CmdletBinding()]
+                param($server, $database, $outputFilepath)
+                throw "Tests must mock permission extraction."
+            }
+        }
+    }
+
+    BeforeEach {
+        InModuleScope DOrcDeployModule {
+            $script:IsProd = $false
+            $script:EnvironmentName = 'BB Labs 01'
+            $script:RefDataApiUrl = 'https://dorc.test:8443/'
+            $script:ApplyPermissionsExePath = 'C:\Tools\Tools.ApplyPermissionsCLI.exe'
+            $script:DBPermsOutput = 'C:\PermissionBackups'
+            $script:DatabasePermissionsMode = $null
+        }
+        Mock -ModuleName DOrcDeployModule Get-Item {
+            [pscustomobject]@{
+                FullName = 'C:\Tools\Tools.ApplyPermissionsCLI.exe'
+                DirectoryName = 'C:\Tools'
+                VersionInfo = [pscustomobject]@{ Comments = 'DOrc.DatabaseAccess/1' }
+            }
+        }
+        Mock -ModuleName DOrcDeployModule GetDBStatus { 'Normal' }
+        Mock -ModuleName DOrcDeployModule GetDateReverse { 'test-date' }
+        Mock -ModuleName DOrcDeployModule Get-DBPermissions { }
+        Mock -ModuleName DOrcDeployModule Test-Path { $true }
+        Mock -ModuleName DOrcDeployModule Get-ChildItem { [pscustomobject]@{ Name = 'permissions.sql' } }
+        Mock -ModuleName DOrcDeployModule Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+    }
+
+    It "keeps existing callers on legacy mode and checks the process result" {
+        Apply-DatabasePermissions -instance 'SQL\DEV' -database 'App DB'
+        Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 1 -Exactly -ParameterFilter {
+            $ArgumentList -eq '"/instance:SQL\DEV" "/database:App DB" "/prod:False"' -and
+            $PassThru -and $Wait -and $WorkingDirectory -eq 'C:\Tools' -and
+            $RedirectStandardOutput -and $RedirectStandardError
+        }
+        Should -Invoke -ModuleName DOrcDeployModule Get-DBPermissions -Times 1 -Exactly
+    }
+
+    It "passes the deployment environment and API to preview without a legacy reset or extraction" {
+        Apply-DatabasePermissions -instance 'SQL\DEV' -database 'App DB' -permissionSource DatabaseAccess -previewOnly
+        Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 1 -Exactly -ParameterFilter {
+            ($ArgumentList -join ' ').Contains('"/permissions:DatabaseAccess"') -and
+            ($ArgumentList -join ' ').Contains('"/environment:BB Labs 01"') -and
+            ($ArgumentList -join ' ').Contains('"/apiurl:https://dorc.test:8443/"') -and
+            ($ArgumentList -join ' ').Contains('"/preview:True"')
+        }
+        Should -Invoke -ModuleName DOrcDeployModule GetDBStatus -Times 0 -Exactly
+        Should -Invoke -ModuleName DOrcDeployModule Get-DBPermissions -Times 0 -Exactly
+    }
+
+    It "honours the environment deployment property for existing callers" {
+        InModuleScope DOrcDeployModule { $script:DatabasePermissionsMode = 'DatabaseAccess' }
+        Apply-DatabasePermissions -instance 'SQL\DEV' -database 'App DB' -previewOnly
+        Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 1 -Exactly -ParameterFilter {
+            ($ArgumentList -join ' ').Contains('"/permissions:DatabaseAccess"')
+        }
+    }
+
+    It "rejects old and application-specific executables before starting them" {
+        Mock -ModuleName DOrcDeployModule Get-Item {
+            [pscustomobject]@{ VersionInfo = [pscustomobject]@{ Comments = '' } }
+        }
+        { Apply-DatabasePermissions 'SQL' 'App' -permissionSource DatabaseAccess } |
+            Should -Throw '*does not support its protocol*'
+        Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 0 -Exactly
+        Should -Invoke -ModuleName DOrcDeployModule GetDBStatus -Times 0 -Exactly
+    }
+
+    It "fails the deployment on a nonzero CLI exit code without retrying legacy" {
+        Mock -ModuleName DOrcDeployModule Start-Process { [pscustomobject]@{ ExitCode = 1 } }
+        { Apply-DatabasePermissions 'SQL' 'App' -permissionSource DatabaseAccess -previewOnly } |
+            Should -Throw '*exit code 1*'
+        Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 1 -Exactly
+    }
+
+    It "does not run either permission implementation when the backup fails" {
+        Mock -ModuleName DOrcDeployModule Get-ChildItem { }
+        { Apply-DatabasePermissions 'SQL' 'App' } | Should -Throw '*Permissions extract failed*'
+        Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 0 -Exactly
+    }
+
+    It "does not turn a preview request into a legacy apply" {
+        { Apply-DatabasePermissions 'SQL' 'App' -previewOnly } | Should -Throw '*only with DatabaseAccess*'
+        Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 0 -Exactly
+    }
+}
+
 Describe "Get-DorcCredSSPStatus tests" {
     Context "Computer reachable" {
 
