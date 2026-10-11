@@ -3112,7 +3112,7 @@ function Apply-DatabasePermissions
         if ($strStatus -ne 'Normal') {
             throw "Database $instance.$database is not in the normal state ($strStatus)."
         }
-        $outputFolder = $DBPermsOutput + "\" + (GetDateReverse) + "-" + $instance.Replace("\", "_") + "." + $database
+        $outputFolder = $DBPermsOutput + "\" + (GetDateReverse) + "-" + $instance.Replace("\", "_") + "." + $database + "-" + [guid]::NewGuid().ToString('N')
         Get-DBPermissions -server $instance -database $database -outputFilepath $outputFolder -ErrorAction Stop
         if (-not (Test-Path -LiteralPath $outputFolder -PathType Container) -or
             @(Get-ChildItem -LiteralPath $outputFolder -Recurse -File -Filter '*.sql' -ErrorAction Stop).Count -eq 0) {

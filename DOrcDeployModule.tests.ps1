@@ -91,6 +91,47 @@ Describe "Apply-DatabasePermissions integration" {
         Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 0 -Exactly
     }
 
+    It "rejects a same-minute <Mode> retry without a fresh backup" -TestCases @(
+        @{ Mode = 'Legacy' }
+        @{ Mode = 'DatabaseAccess' }
+    ) {
+        param($Mode)
+
+        InModuleScope DOrcDeployModule -Parameters @{ BackupRoot = (Join-Path $TestDrive $Mode) } {
+            param($BackupRoot)
+            $script:DBPermsOutput = $BackupRoot
+        }
+        $script:ExtractionFolders = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DOrcDeployModule Get-DBPermissions {
+            param($server, $database, $outputFilepath)
+            $script:ExtractionFolders.Add($outputFilepath)
+            [System.IO.Directory]::CreateDirectory($outputFilepath) | Out-Null
+            if ($script:ExtractionFolders.Count -eq 1) {
+                [System.IO.File]::WriteAllText(
+                    (Join-Path $outputFilepath 'permissions.sql'), '-- first attempt backup'
+                )
+            }
+        }
+        Mock -ModuleName DOrcDeployModule Test-Path {
+            param($LiteralPath)
+            [System.IO.Directory]::Exists($LiteralPath)
+        }
+        Mock -ModuleName DOrcDeployModule Get-ChildItem {
+            param($LiteralPath)
+            [System.IO.Directory]::GetFiles($LiteralPath, '*.sql', [System.IO.SearchOption]::AllDirectories)
+        }
+
+        Apply-DatabasePermissions 'SQL\DEV' 'App DB' -permissionSource $Mode
+        { Apply-DatabasePermissions 'SQL\DEV' 'App DB' -permissionSource $Mode } |
+            Should -Throw '*Permissions extract failed*'
+
+        Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 1 -Exactly
+        Should -Invoke -ModuleName DOrcDeployModule Get-DBPermissions -Times 2 -Exactly
+        $script:ExtractionFolders[1] | Should -Not -Be $script:ExtractionFolders[0]
+        [System.IO.File]::Exists((Join-Path $script:ExtractionFolders[0] 'permissions.sql')) |
+            Should -BeTrue
+    }
+
     It "does not turn a preview request into a legacy apply" {
         { Apply-DatabasePermissions 'SQL' 'App' -previewOnly } | Should -Throw '*only with DatabaseAccess*'
         Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 0 -Exactly

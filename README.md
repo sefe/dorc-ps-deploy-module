@@ -54,7 +54,9 @@ tools also manage application accounts, which the new SQL-only API does not.
 There is no fallback from DatabaseAccess to legacy.
 
 Both apply modes still require a successful permissions backup and a database in
-the normal state. Preview skips the backup/legacy SQL connection and never applies.
+the normal state. Each extraction uses a unique backup folder so retries cannot
+reuse stale SQL files; earlier backups are retained. Preview skips the backup/legacy
+SQL connection and never applies.
 Backup failure, an abnormal database state, or a failed CLI now stops the deployment
 rather than allowing subsequent restore steps to continue.
 
