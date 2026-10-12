@@ -6,9 +6,14 @@ BeforeAll {
 Describe "DeleteRabbit Mode Parameter Tests" {
     Context "Valid mode parameter" {
         BeforeAll {
-            Mock -CommandName Invoke-RestMethod -MockWith { return @() }
-            Mock -CommandName ConvertTo-SecureString -MockWith { return "SecurePassword" }
-            Mock -CommandName Add-Type -MockWith { }
+            Mock -ModuleName DOrcDeployModule -CommandName Invoke-RestMethod -MockWith { return @() }
+            Mock -ModuleName DOrcDeployModule -CommandName ConvertTo-SecureString -MockWith {
+                $securePassword = [System.Security.SecureString]::new()
+                "SecurePassword".ToCharArray() | ForEach-Object { $securePassword.AppendChar($_) }
+                $securePassword.MakeReadOnly()
+                return $securePassword
+            }
+            Mock -ModuleName DOrcDeployModule -CommandName Add-Type -MockWith { }
         }
         
         It "Should handle 'exchange' mode correctly" {
@@ -22,14 +27,22 @@ Describe "DeleteRabbit Mode Parameter Tests" {
     
     Context "Invalid mode parameter" {
         BeforeAll {
-            Mock -CommandName Invoke-RestMethod -MockWith { return @() }
-            Mock -CommandName ConvertTo-SecureString -MockWith { return "SecurePassword" }
-            Mock -CommandName Add-Type -MockWith { }
+            Mock -ModuleName DOrcDeployModule -CommandName Invoke-RestMethod -MockWith { return @() }
+            Mock -ModuleName DOrcDeployModule -CommandName ConvertTo-SecureString -MockWith {
+                $securePassword = [System.Security.SecureString]::new()
+                "SecurePassword".ToCharArray() | ForEach-Object { $securePassword.AppendChar($_) }
+                $securePassword.MakeReadOnly()
+                return $securePassword
+            }
+            Mock -ModuleName DOrcDeployModule -CommandName Add-Type -MockWith { }
         }
         
-        It "Should not throw for invalid mode (warning is displayed instead)" {
-            # The function now handles invalid modes gracefully with a warning instead of throwing
-            { DeleteRabbit -mode 'invalid' -deleteStrings @('test') -RabbitUserName 'user' -RabbitPassword 'pass' -RabbitAPIPort '15672' -Server 'localhost' -WarningAction SilentlyContinue } | Should -Not -Throw
+        It "Should warn and skip REST calls for an invalid mode" {
+            $warnings = @(DeleteRabbit -mode 'invalid' -deleteStrings @('test') -RabbitUserName 'user' -RabbitPassword 'pass' -RabbitAPIPort '15672' -Server 'localhost' 3>&1)
+
+            $warnings | Should -HaveCount 1
+            $warnings[0].Message | Should -Be "Invalid mode specified: invalid. Valid values are 'exchange' or 'queue'."
+            Should -Invoke -ModuleName DOrcDeployModule -CommandName Invoke-RestMethod -Times 0 -Exactly
         }
     }
 }

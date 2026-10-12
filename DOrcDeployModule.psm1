@@ -153,7 +153,7 @@ function CheckDiskSpace([string[]] $servers, [int] $minMB = 100) {
     foreach ($server in $servers) {
         $serv = "[" + $server.Trim() + "]"
         try {
-            $ntfsVolumes = Get-CimInstance -ClassName Win32_Volume -ComputerName $server | Where-Object {($_.FileSystem -eq "NTFS") -and ($_.driveletter)}
+            $ntfsVolumes = Get-CimInstance -ClassName Win32_Volume -ComputerName $server -ErrorAction Stop | Where-Object {($_.FileSystem -eq "NTFS") -and ($_.driveletter)}
         }
         catch {
             Write-Warning "Failed to query disk space on $serv : $($_.Exception.Message)"
@@ -793,6 +793,11 @@ function LogOffUsers([string] $strComputerName) {
 function DeleteRabbit([string]$mode, [string[]]$deleteStrings, [string]$RabbitUserName, [string]$RabbitPassword, [string]$RabbitAPIPort, [string] $Server, [bool]$discardMessages = $false) {
     $exitCode = 0
 
+    if ($mode -notin @('exchange', 'queue')) {
+        Write-Warning "Invalid mode specified: $mode. Valid values are 'exchange' or 'queue'."
+        return
+    }
+
     trap {
         $e = $error[0].Exception
         $e.Message
@@ -886,9 +891,6 @@ function DeleteRabbit([string]$mode, [string[]]$deleteStrings, [string]$RabbitUs
                     Write-Host "Deleted queue: " $deleteQueue.name		
                 }
             }
-        }
-        else {
-            Write-Warning "Invalid mode specified: $mode. Valid values are 'exchange' or 'queue'."
         }
     }
 }
@@ -2695,8 +2697,22 @@ function Invoke-RemoteProcess([string] $serverName, [string] $strExecutable, [st
             Invoke-Command -session $session { $Process = New-Object System.Diagnostics.Process }
             Invoke-Command -session $session { $Process.StartInfo = $ProcessInfo }
             Invoke-Command -session $session { $Process.Start()}
-            Invoke-Command -session $session { try { $out = $Process.StandardOutput.ReadToEndAsync() } catch { Write-Verbose "Could not read StandardOutput" } }
-            Invoke-Command -session $session { try { $outErr = $Process.StandardError.ReadToEndAsync() } catch { Write-Verbose "Could not read StandardError" } }
+            Invoke-Command -session $session -ErrorAction Stop {
+                try {
+                    $out = $Process.StandardOutput.ReadToEndAsync()
+                }
+                catch {
+                    throw "Could not read StandardOutput: $($_.Exception.Message)"
+                }
+            }
+            Invoke-Command -session $session -ErrorAction Stop {
+                try {
+                    $outErr = $Process.StandardError.ReadToEndAsync()
+                }
+                catch {
+                    throw "Could not read StandardError: $($_.Exception.Message)"
+                }
+            }
             Invoke-Command -session $session { $Process.WaitForExit() }
             if (![String]::IsNullOrEmpty($strExecutableChild)) {
                 do {
@@ -3526,10 +3542,6 @@ function CheckBackup ([string] $SourceInstance, [string] $SourceDB, [string] $Re
 		}
 		else { return [PSCustomObject]@{ IsValid = $false; FullPath = $fullbackpath.path; FullPathType = $fullPathType; IncPath = $null; IncPathType = $null } }
     }
-    else {
-        Write-Warning "Unexpected RestoreMode: $RestoreMode after validation"
-        return $false
-    }
 }
 
 Function Get-MSHotfix  {  
@@ -4014,7 +4026,7 @@ Function Check-IsCitrixServer {
 
     Try {
         $compOS = "unknown"
-        $os = Get-CimInstance -ComputerName $compName -ClassName Win32_OperatingSystem -Property *
+        $os = Get-CimInstance -ComputerName $compName -ClassName Win32_OperatingSystem -Property * -ErrorAction Stop
         $compOS = $os.Caption
         $os = $null
     } catch { 
