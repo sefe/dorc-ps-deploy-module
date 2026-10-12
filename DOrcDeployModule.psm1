@@ -810,14 +810,18 @@ function DeleteRabbit([string]$mode, [string[]]$deleteStrings, [string]$RabbitUs
     $getSyntax = [System.UriParser].GetMethod("GetSyntax", 40)
     # field m_Flags contains information about Uri parsing behaviour
     $flags = [System.UriParser].GetField("m_Flags", 36)
-	 
-    $parser = $getSyntax.Invoke($null, $protocol)
-    $currentValue = $flags.GetValue($parser)
-    # check if un-escaping enabled
-    if (($currentValue -band $UnEscapeDotsAndSlashes) -eq $UnEscapeDotsAndSlashes) {
-        $newValue = $currentValue -bxor $UnEscapeDotsAndSlashes
-        # disable unescaping by removing UnEscapeDotsAndSlashes flag
-        $flags.SetValue($parser, $newValue)
+
+    if ($getSyntax -and $flags) {
+        $parser = $getSyntax.Invoke($null, $protocol)
+        if ($parser) {
+            $currentValue = $flags.GetValue($parser)
+            # check if un-escaping enabled
+            if (($currentValue -band $UnEscapeDotsAndSlashes) -eq $UnEscapeDotsAndSlashes) {
+                $newValue = $currentValue -bxor $UnEscapeDotsAndSlashes
+                # disable unescaping by removing UnEscapeDotsAndSlashes flag
+                $flags.SetValue($parser, $newValue)
+            }
+        }
     }
 
     $secpasswd = ConvertTo-SecureString $RabbitPassword -AsPlainText -Force
