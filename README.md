@@ -64,7 +64,11 @@ The DatabaseAccess schema/API (including machine-to-machine audit identity suppo
 must be deployed first. The API database allowlist and independent execution switch
 remain authoritative. The CLI authenticates using its configured OAuth client or
 Windows identity; target SQL operations use the **API service identity**. Configure
-API service-account SQL permissions and trusted certificates before enabling apply.
+`DatabaseAccessSqlIdentity` with that Windows identity. For non-preview DatabaseAccess
+applies, the module uses the deployment identity after a successful backup to recreate
+the SQL login/database user removed by a restore and add it to `db_owner` on the target
+database before calling the API. Preview does not perform this bootstrap. Configure
+trusted certificates before enabling apply.
 Production applies remain additive-only. Review/import desired state before moving
 an environment to the new mode; no automatic legacy import is performed.
 

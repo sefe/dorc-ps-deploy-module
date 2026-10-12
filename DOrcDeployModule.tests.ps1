@@ -11,6 +11,16 @@ Describe "Apply-DatabasePermissions integration" {
                 param($server, $database, $outputFilepath)
                 throw "Tests must mock permission extraction."
             }
+            function script:Invoke-Sqlcmd {
+                [CmdletBinding()]
+                param(
+                    [switch] $TrustServerCertificate,
+                    $ServerInstance,
+                    $Query,
+                    $QueryTimeout
+                )
+                throw "Tests must mock SQL execution."
+            }
         }
     }
 
@@ -22,6 +32,7 @@ Describe "Apply-DatabasePermissions integration" {
             $script:ApplyPermissionsExePath = 'C:\Tools\Tools.ApplyPermissionsCLI.exe'
             $script:DBPermsOutput = 'C:\PermissionBackups'
             $script:DatabasePermissionsMode = $null
+            $script:DatabaseAccessSqlIdentity = 'DOMAIN\DOrcApi'
         }
         Mock -ModuleName DOrcDeployModule Get-Item {
             [pscustomobject]@{
@@ -35,6 +46,7 @@ Describe "Apply-DatabasePermissions integration" {
         Mock -ModuleName DOrcDeployModule Get-DBPermissions { }
         Mock -ModuleName DOrcDeployModule Test-Path { $true }
         Mock -ModuleName DOrcDeployModule Get-ChildItem { [pscustomobject]@{ Name = 'permissions.sql' } }
+        Mock -ModuleName DOrcDeployModule Invoke-Sqlcmd { }
         Mock -ModuleName DOrcDeployModule Start-Process { [pscustomobject]@{ ExitCode = 0 } }
     }
 
@@ -58,6 +70,7 @@ Describe "Apply-DatabasePermissions integration" {
         }
         Should -Invoke -ModuleName DOrcDeployModule GetDBStatus -Times 0 -Exactly
         Should -Invoke -ModuleName DOrcDeployModule Get-DBPermissions -Times 0 -Exactly
+        Should -Invoke -ModuleName DOrcDeployModule Invoke-Sqlcmd -Times 0 -Exactly
     }
 
     It "honours the environment deployment property for existing callers" {
@@ -76,6 +89,7 @@ Describe "Apply-DatabasePermissions integration" {
             Should -Throw '*does not support its protocol*'
         Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 0 -Exactly
         Should -Invoke -ModuleName DOrcDeployModule GetDBStatus -Times 0 -Exactly
+        Should -Invoke -ModuleName DOrcDeployModule Invoke-Sqlcmd -Times 0 -Exactly
     }
 
     It "fails the deployment on a nonzero CLI exit code without retrying legacy" {
@@ -88,6 +102,33 @@ Describe "Apply-DatabasePermissions integration" {
     It "does not run either permission implementation when the backup fails" {
         Mock -ModuleName DOrcDeployModule Get-ChildItem { }
         { Apply-DatabasePermissions 'SQL' 'App' } | Should -Throw '*Permissions extract failed*'
+        Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 0 -Exactly
+        Should -Invoke -ModuleName DOrcDeployModule Invoke-Sqlcmd -Times 0 -Exactly
+    }
+
+    It "bootstraps the configured API SQL identity after backup and before DatabaseAccess apply" {
+        Apply-DatabasePermissions 'SQL\DEV' 'App DB' -permissionSource DatabaseAccess
+
+        Should -Invoke -ModuleName DOrcDeployModule Invoke-Sqlcmd -Times 1 -Exactly -ParameterFilter {
+            $ServerInstance -eq 'SQL\DEV' -and
+            $TrustServerCertificate -and
+            $QueryTimeout -eq 600 -and
+            $ErrorAction -eq 'Stop' -and
+            $Query.Contains("CREATE LOGIN [DOMAIN\DOrcApi] FROM WINDOWS") -and
+            $Query.Contains("USE [App DB]") -and
+            $Query.Contains("ALTER ROLE [db_owner] ADD MEMBER [DOMAIN\DOrcApi]")
+        }
+        Should -Invoke -ModuleName DOrcDeployModule Get-DBPermissions -Times 1 -Exactly
+        Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 1 -Exactly
+    }
+
+    It "requires the API SQL identity before a DatabaseAccess apply" {
+        InModuleScope DOrcDeployModule { $script:DatabaseAccessSqlIdentity = $null }
+
+        { Apply-DatabasePermissions 'SQL' 'App' -permissionSource DatabaseAccess } |
+            Should -Throw '*DatabaseAccessSqlIdentity must be configured*'
+
+        Should -Invoke -ModuleName DOrcDeployModule Get-DBPermissions -Times 1 -Exactly
         Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 0 -Exactly
     }
 
