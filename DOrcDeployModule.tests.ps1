@@ -3,6 +3,58 @@ BeforeAll {
     Import-Module "$here\DOrcDeployModule.psm1" -Force -ErrorAction Stop
 }
 
+Describe "DeleteRabbit Mode Parameter Tests" {
+    Context "Valid mode parameter" {
+        BeforeAll {
+            Mock -ModuleName DOrcDeployModule -CommandName Invoke-RestMethod -MockWith { return @() }
+            Mock -ModuleName DOrcDeployModule -CommandName ConvertTo-SecureString -MockWith {
+                $securePassword = [System.Security.SecureString]::new()
+                "SecurePassword".ToCharArray() | ForEach-Object { $securePassword.AppendChar($_) }
+                $securePassword.MakeReadOnly()
+                return $securePassword
+            }
+            Mock -ModuleName DOrcDeployModule -CommandName Add-Type -MockWith { }
+        }
+        
+        It "Should handle 'exchange' mode correctly" {
+            { DeleteRabbit -mode 'exchange' -deleteStrings @('test') -RabbitUserName 'user' -RabbitPassword 'pass' -RabbitAPIPort '15672' -Server 'localhost' } | Should -Not -Throw
+        }
+        
+        It "Should handle 'queue' mode correctly" {
+            { DeleteRabbit -mode 'queue' -deleteStrings @('test') -RabbitUserName 'user' -RabbitPassword 'pass' -RabbitAPIPort '15672' -Server 'localhost' } | Should -Not -Throw
+        }
+    }
+    
+    Context "Invalid mode parameter" {
+        BeforeAll {
+            Mock -ModuleName DOrcDeployModule -CommandName Invoke-RestMethod -MockWith { return @() }
+            Mock -ModuleName DOrcDeployModule -CommandName ConvertTo-SecureString -MockWith {
+                $securePassword = [System.Security.SecureString]::new()
+                "SecurePassword".ToCharArray() | ForEach-Object { $securePassword.AppendChar($_) }
+                $securePassword.MakeReadOnly()
+                return $securePassword
+            }
+            Mock -ModuleName DOrcDeployModule -CommandName Add-Type -MockWith { }
+        }
+        
+        It "Should warn and skip REST calls for an invalid mode" {
+            $warnings = @(DeleteRabbit -mode 'invalid' -deleteStrings @('test') -RabbitUserName 'user' -RabbitPassword 'pass' -RabbitAPIPort '15672' -Server 'localhost' 3>&1)
+
+            $warnings | Should -HaveCount 1
+            $warnings[0].Message | Should -Be "Invalid mode specified: invalid. Valid values are 'exchange' or 'queue'."
+            Should -Invoke -ModuleName DOrcDeployModule -CommandName Invoke-RestMethod -Times 0 -Exactly
+        }
+    }
+}
+
+Describe "CheckBackup RestoreMode Parameter Tests" {
+    Context "Invalid RestoreMode value" {
+        It "Should throw for invalid RestoreMode" {
+            { CheckBackup -SourceInstance 'localhost' -SourceDB 'TestDB' -RestoreMode 'invalid' } | Should -Throw "wrong RestoreMode*"
+        }
+    }
+}
+
 Describe "Get-DorcCredSSPStatus tests" {
     Context "Computer reachable" {
 
