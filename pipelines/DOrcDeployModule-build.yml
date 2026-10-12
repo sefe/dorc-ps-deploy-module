@@ -1,29 +1,80 @@
 name: $(Build.DefinitionName)_$(Build.SourceBranchName)_$(Date:yy).$(Date:MM).$(Date:dd)$(Rev:.r)
 
+parameters:
+- name: publishToProget
+  displayName: Publish module to ProGet
+  type: boolean
+  default: false
+
 trigger:
 - main
 - feature/*
 
-pool:
-  name: TRADING-DOTNET-02
+stages:
+- stage: Build
+  displayName: Build module
+  jobs:
+  - job: BuildModule
+    displayName: Version and package module
+    pool:
+      name: TRADING-DOTNET-02
+    steps:
+    - task: PowerShell@2
+      displayName: Version manifest
+      inputs:
+        filePath: '$(Build.SourcesDirectory)\UpdateVersion.ps1'
+        arguments: '-ProjectDir "$(Build.SourcesDirectory)" -BuildNumber "$(Build.BuildNumber)"'
 
-steps:
-- task: PowerShell@2
-  displayName: 'Versioning manifest'
-  inputs:
-    filePath: '$(Build.SourcesDirectory)\UpdateVersion.ps1'
-    arguments: '-ProjectDir "$(Build.SourcesDirectory)" -BuildNumber "$(Build.BuildNumber)"'
+    - task: CopyFiles@2
+      displayName: Stage module files
+      inputs:
+        SourceFolder: $(Build.SourcesDirectory)
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
 
-- task: CopyFiles@2
-  displayName: 'Copy Files to DROP'
-  inputs:
-    SourceFolder: $(Build.SourcesDirectory)
-    TargetFolder: '$(Build.ArtifactStagingDirectory)'
+    - task: PublishBuildArtifacts@1
+      displayName: Publish file-share artifact
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: drop
+        publishLocation: FilePath
+        TargetPath: '$(DropFolder)\$(Build.DefinitionName)\$(Build.BuildNumber)'
 
-- task: PublishBuildArtifacts@1
-  displayName: drop 'Publish Artifact DROP'
-  inputs:
-    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
-    ArtifactName: 'drop'
-    publishLocation: 'FilePath'
-    TargetPath: '$(DropFolder)\$(Build.DefinitionName)\$(Build.BuildNumber)'
+    - task: PublishPipelineArtifact@1
+      displayName: Publish pipeline artifact
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+        artifact: module-drop
+
+- stage: Publish
+  displayName: Publish module to ProGet
+  dependsOn: Build
+  condition: and(succeeded(), eq(${{ parameters.publishToProget }}, true), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: PublishModule
+    displayName: Publish DOrcDeployModule
+    environment: Proget
+    pool:
+      name: TRADING-DOTNET-02
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: module-drop
+
+          - task: PowerShell@2
+            displayName: Publish module
+            inputs:
+              targetType: inline
+              script: |
+                Set-Location '$(Pipeline.Workspace)\module-drop'
+                Set-PSRepository -Name PowerShellModules `
+                  -SourceLocation '$(PowerShellModulesRepositoryUrl)' `
+                  -PublishLocation '$(PowerShellModulesRepositoryUrl)'
+                Publish-Module `
+                  -Name '.\DOrcDeployModule.psm1' `
+                  -Repository PowerShellModules `
+                  -NuGetApiKey '$(NugetApiKey)' `
+                  -Force `
+                  -Verbose
+              failOnStderr: true

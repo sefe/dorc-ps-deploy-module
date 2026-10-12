@@ -69,6 +69,33 @@ jobs:
           pwsh ./UpdateVersion.ps1 -ProjectDir $Env:GITHUB_WORKSPACE -BuildNumber $Env:BuildNumber
         shell: pwsh
 
+      - name: Run Pester tests
+        shell: pwsh
+        run: |
+          # Install Pester 5 (windows-latest agents ship with Pester 3) and
+          # run every *.tests.ps1 in the repo root. Non-zero exit on failure
+          # gates the CI step.
+          if (-not (Get-Module -ListAvailable Pester |
+                    Where-Object { $_.Version -ge [version]'5.0.0' })) {
+              Install-Module -Name Pester -MinimumVersion 5.0.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          }
+          Import-Module Pester -MinimumVersion 5.0.0 -Force
+
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path             = './'
+          $cfg.Run.Exit             = $true  # non-zero exit on failure — gates the CI step
+          $cfg.Output.Verbosity     = 'Detailed'
+          $cfg.TestResult.Enabled   = $true
+          $cfg.TestResult.OutputPath = './pester-results.xml'
+          Invoke-Pester -Configuration $cfg
+
+      - name: Upload Pester test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-results
+          path: pester-results.xml
+
       - name: Copy updated files
         id: copy_files
         run: |

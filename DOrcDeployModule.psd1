@@ -10,7 +10,7 @@
     RootModule = 'DOrcDeployModule.psm1'
     
     # Version number of this module.
-    ModuleVersion = '19.4.30.1'
+    ModuleVersion = '25.4.3.101'
     
     # Supported PSEditions
     # CompatiblePSEditions = @()
@@ -96,7 +96,7 @@
             # Tags = @()
     
             # A URL to the license for this module.
-            # LicenseUri = ''
+            LicenseUri = 'https://github.com/sefe/DOrcDeployModule/blob/main/LICENSE.md'
     
             # A URL to the main website for this project.
             # ProjectUri = ''
@@ -107,8 +107,12 @@
             # ReleaseNotes of this module
             # ReleaseNotes = ''
     
+            # Prerelease string of this module
+            # Prerelease = ''
+            # Flag to indicate whether the module requires explicit user acceptance for install/update/save
+            # RequireLicenseAcceptance = $false
             # External dependent modules of this module
-            # ExternalModuleDependencies = ''
+            # ExternalModuleDependencies = @()
     
         } # End of PSData hashtable
     

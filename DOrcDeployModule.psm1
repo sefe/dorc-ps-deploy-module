@@ -1,3 +1,82 @@
+#region Helper Functions
+
+<#
+.SYNOPSIS
+    Safely formats a parameter for logging, hiding sensitive values.
+.PARAMETER Parameter
+    The parameter string in format "Name=Value"
+.OUTPUTS
+    Formatted string safe for logging
+#>
+function Format-ParameterForLogging {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [string]$Parameter,
+        [string]$MaskString = "***HIDDEN***"
+    )
+    
+    process {
+        if ($Parameter -notmatch '^([^=]+)=(.*)$') {
+            Write-Warning "Invalid format: 'paramName=paramValue' expected"
+            return $Parameter
+        }
+        
+        $paramName = $Matches[1].Trim()
+        $paramValue = $Matches[2].Trim()
+        
+        # Check if the parameter name itself indicates it's a secret
+        $secretParams = 'password', 'pwd', 'secret', 'key', 'token', 'credential', 'api(key|secret)', 'accesskey', 'auth(header|token)'
+        if ($paramName -match ($secretParams -join '|')) {
+            return "$paramName=$MaskString"
+        }
+        
+        # Mask secrets within connection-string style values
+        $maskedValue = $paramValue -replace '(?i)(password|pwd|key|secret|token|accesskey|accountkey)\s*=\s*[^;]+', "`$1=$MaskString"
+        
+        return "$paramName=$maskedValue"
+    }
+}
+
+<#
+.SYNOPSIS
+    TEMPORARY FIX: retries Invoke-Command against a single computer to work around
+    intermittent WSMan "could not launch a host process" errors until root cause is found.
+#>
+function Invoke-CommandWithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ComputerName,
+        [Parameter(Mandatory = $true)]
+        [scriptblock] $ScriptBlock,
+        [object[]] $ArgumentList,
+        [int] $RetryCount = 5,
+        [int] $RetryDelaySeconds = 5
+    )
+    $invokeParams = @{
+        ComputerName = $ComputerName
+        ScriptBlock  = $ScriptBlock
+        ErrorAction  = 'Stop'
+    }
+    # Invoke-Command rejects an explicit $null for -ArgumentList, so only pass it when supplied
+    if ($PSBoundParameters.ContainsKey('ArgumentList')) { $invokeParams.ArgumentList = $ArgumentList }
+    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+        try {
+            $result = Invoke-Command @invokeParams
+            Write-Host "    Invoke-Command to $ComputerName is successfull"
+            return $result
+        }
+        catch {
+            Write-Host "    Invoke-Command to $ComputerName failed (attempt $attempt of $RetryCount): $($_.Exception.Message)"
+            if ($attempt -eq $RetryCount) { throw }
+            Start-Sleep -Seconds $RetryDelaySeconds
+        }
+    }
+}
+#endregion
+
+
 function Invoke-VsDbCmd {
     Param
     (
@@ -74,7 +153,7 @@ function CheckDiskSpace([string[]] $servers, [int] $minMB = 100) {
     foreach ($server in $servers) {
         $serv = "[" + $server.Trim() + "]"
         try {
-            $ntfsVolumes = Get-WmiObject -Class win32_volume -cn $server | Where-Object {($_.FileSystem -eq "NTFS") -and ($_.driveletter)}
+            $ntfsVolumes = Get-CimInstance -ClassName Win32_Volume -ComputerName $server | Where-Object {($_.FileSystem -eq "NTFS") -and ($_.driveletter)}
         }
         catch {
             Write-Warning "Failed to query disk space on $serv : $($_.Exception.Message)"
@@ -106,26 +185,92 @@ function CheckDiskSpace([string[]] $servers, [int] $minMB = 100) {
     return $bolSpaceCheckOK
 } 
 
+function Get-InstalledMsiProducts([string] $strComputerName) {
+    # Fast, registry-based replacement for the notoriously slow Win32_Product WMI/CIM class.
+    # Enumerating Win32_Product forces the Windows Installer to run a consistency check
+    # (self-repair validation) against EVERY installed MSI on the target, which routinely
+    # takes 30-90+ seconds and spams MsiInstaller reconfiguration events into the event log.
+    # Reading the Uninstall registry hives is sub-second and side-effect free.
+    $results = New-Object System.Collections.ArrayList
+    $uninstallKeys = @(
+        "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+    $reg = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey("LocalMachine", $strComputerName)
+    try {
+        foreach ($uninstallKey in $uninstallKeys) {
+            $subkey = $reg.OpenSubKey($uninstallKey)
+            if ($null -eq $subkey) { continue }
+            foreach ($keyName in $subkey.GetSubKeyNames()) {
+                $prodKey = $reg.OpenSubKey($uninstallKey + "\" + $keyName)
+                if ($null -eq $prodKey) { continue }
+                $dispName = $prodKey.GetValue("DisplayName")
+                # Match Win32_Product's MSI-only scope: require the WindowsInstaller flag AND a
+                # well-formed ProductCode GUID key name. This avoids matching non-MSI products
+                # that happen to use GUID-like uninstall keys.
+                $isMsi = ($prodKey.GetValue("WindowsInstaller") -eq 1) -and `
+                         ($keyName -match '^\{[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\}$')
+                if ((![String]::IsNullOrEmpty($dispName)) -and $isMsi) {
+                    [void]$results.Add([PSCustomObject]@{
+                        Name            = $dispName
+                        Version         = $prodKey.GetValue("DisplayVersion")
+                        ProductCode     = $keyName
+                        UninstallString = $prodKey.GetValue("UninstallString")
+                        IsMsi           = $true
+                    })
+                }
+                $prodKey.Close()
+            }
+            $subkey.Close()
+        }
+    }
+    finally {
+        $reg.Close()
+    }
+    return $results
+}
+
+function Remove-MsiProductByCode([string] $strComputerName, $Product) {
+    if ((-not $Product.IsMsi) -or [String]::IsNullOrEmpty($Product.ProductCode)) {
+        Write-Host "          No MSI ProductCode found in registry for" $Product.Name "- cannot uninstall via msiexec"
+        return $false
+    }
+    try {
+        $exitCode = Invoke-CommandWithRetry -ComputerName $strComputerName -ScriptBlock {
+            param($code)
+            $ErrorActionPreference = 'Stop'
+            $p = Start-Process -FilePath "msiexec.exe" -ArgumentList "/x", $code, "/qn", "/norestart" -Wait -PassThru
+            return $p.ExitCode
+        } -ArgumentList $Product.ProductCode
+    }
+    catch {
+        Write-Host "          Remote uninstall failed for" $Product.Name "-" $_.Exception.Message
+        return $false
+    }
+    # 0 = success, 3010 = success but a reboot is required
+    if ($exitCode -eq 0 -or $exitCode -eq 3010) {
+        return $true
+    }
+    Write-Host "          msiexec returned exit code" $exitCode "for" $Product.Name
+    return $false
+}
+
 function UnInstallProducts([string] $strComputerName, $ProductsToRemove) {
     $bolReturn = $true
     if (CheckDiskSpace $strComputerName) {
-        $Products = Get-WmiObject Win32_Product -ComputerName $strComputerName
+        try {
+            $Products = Get-InstalledMsiProducts $strComputerName
+        }
+        catch {
+            Write-Host "Failed to enumerate installed products on $strComputerName - $($_.Exception.Message)"
+            return $false
+        }
         foreach ($Product in $Products) {
             foreach ($strProductName in $ProductsToRemove) {
                 if ($Product.Name -ne $null) {
-                    if ($strProductName.Contains("*") -and $Product.Name.Contains($strProductName.Replace("*", ""))) {
-                        Write-Host "Removing:" $Product.Name " Version:" $Product.Version " GUID:" $Product.IdentifyingNumber " from" $strComputerName
-                        if ($Product.Uninstall().ReturnValue -eq 0) {
-                            Write-Host "          Success..."
-                        }
-                        else {
-                            $bolReturn = $false
-                            Write-Host "FAILED to remove" $Product.Name
-                        }
-                    }
-                    if ($strProductName -eq $Product.Name) {
-                        Write-Host "Removing:" $Product.Name " Version:" $Product.Version " GUID:" $Product.IdentifyingNumber " from" $strComputerName
-                        if ($Product.Uninstall().ReturnValue -eq 0) {
+                    if (($strProductName.Contains("*") -and $Product.Name.Contains($strProductName.Replace("*", ""))) -or ($strProductName -eq $Product.Name)) {
+                        Write-Host "Removing:" $Product.Name " Version:" $Product.Version " GUID:" $Product.ProductCode " from" $strComputerName
+                        if ((Remove-MsiProductByCode $strComputerName $Product) -eq $true) {
                             Write-Host "          Success..."
                         }
                         else {
@@ -151,32 +296,26 @@ function RemoveMSI([string] $strComputerName, [string] $strMSIFullName, $Product
         Write-Host "Attempting to remove using msi ProductCode"
         $bolReturn = UninstallProduct -strComputerName $strComputerName -strMSIFullName $strMSIFullName
 
-        $Products = Get-WmiObject Win32_Product -ComputerName $strComputerName
+        try {
+            $Products = Get-InstalledMsiProducts $strComputerName
+        }
+        catch {
+            Write-Host "Failed to enumerate installed products on $strComputerName - $($_.Exception.Message)"
+            return $false
+        }
         foreach ($Product in $Products) {
             foreach ($strProductName in $ProductsToRemove) {
                 if ($Product.Name -ne $null) {
-                    if ($strProductName.Contains("*") -and $Product.Name.Contains($strProductName.Replace("*", ""))) {
-                        Write-Host "Removing:" $Product.Name " Version:" $Product.Version " GUID:" $Product.IdentifyingNumber " from" $strComputerName
-                        Write-Host "Unable to uninstall based on Product Code, reverting to WMI"
-                        if ($Product.Uninstall().ReturnValue -eq 0) {
+                    if (($strProductName.Contains("*") -and $Product.Name.Contains($strProductName.Replace("*", ""))) -or ($strProductName -eq $Product.Name)) {
+                        Write-Host "Removing:" $Product.Name " Version:" $Product.Version " GUID:" $Product.ProductCode " from" $strComputerName
+                        Write-Host "Unable to uninstall based on Product Code, reverting to registry-based msiexec"
+                        if ((Remove-MsiProductByCode $strComputerName $Product) -eq $true) {
                             Write-Host "          Success..."
                         }
                         else {
                             $bolReturn = $false
                             Write-Host "FAILED to remove" $Product.Name
                         }
-                    }
-                    if ($strProductName -eq $Product.Name) {
-                        Write-Host "Removing:" $Product.Name " Version:" $Product.Version " GUID:" $Product.IdentifyingNumber " from" $strComputerName
-                        Write-Host "Unable to uninstall based on Product Code, reverting to WMI"
-                        if ($Product.Uninstall().ReturnValue -eq 0) {
-                            Write-Host "          Success..."
-                        }
-                        else {
-                            $bolReturn = $false
-                            Write-Host "FAILED to remove" $Product.Name
-                        }
-
                     }
                 }
             }
@@ -208,7 +347,7 @@ function UninstallProduct([string] $strComputerName, [string] $strMSIFullName) {
  
     $bolReturn = $false
     $strMSIName = $strMSIFullName.SubString(($strMSIFullName.LastIndexOf("\") + 1), ($strMSIFullName.Length - ($strMSIFullName.LastIndexOf("\") + 1)))
-    $DestFolderCollection = Invoke-Command -ComputerName $strComputerName { Get-Item env:TEMP }
+    $DestFolderCollection = Invoke-CommandWithRetry -ComputerName $strComputerName -ScriptBlock { Get-Item env:TEMP }
     $LocalMSI = Join-Path $DestFolderCollection.Value $strMSIName
     $DestFolder = Join-Path \\$strComputerName $DestFolderCollection.Value
     $DestFolder = $DestFolder -replace ":", "$"
@@ -243,7 +382,7 @@ function UninstallProduct([string] $strComputerName, [string] $strMSIFullName) {
         $Stream.Close()
         $Script = "&$strLocalInstallScript"
         $ScriptBlock = $executioncontext.invokecommand.NewScriptBlock($Script)
-        $Result = Invoke-Command -Computer $strComputerName -ScriptBlock $ScriptBlock
+        $Result = Invoke-Command -ComputerName $strComputerName -ScriptBlock $ScriptBlock
         Start-Sleep -Seconds 10
         if (Test-Path $strUNCLogFileName) {
             $bolExtraAnalysis = $false
@@ -282,7 +421,7 @@ function UninstallProduct([string] $strComputerName, [string] $strMSIFullName) {
                 }
             }
             else {
-                Write-Host "Susccess criteria couldn't be found in the MSI log file..."
+                Write-Host "Success criteria couldn't be found in the MSI log file..."
                 if ($bolExtraAnalysis) {
                     $oErrorsFile = Get-ChildItem -Path $outputFolder -Filter "*_Errors.txt"
                     write-host "[WiLogUtl] Importing" $oErrorsFile.FullName
@@ -308,7 +447,7 @@ function UninstallProduct([string] $strComputerName, [string] $strMSIFullName) {
 function InstallMSI([string] $strComputerName, [string] $strMSIFullName, $arrParameters) {
     $bolReturn = $false
     $strMSIName = $strMSIFullName.SubString(($strMSIFullName.LastIndexOf("\") + 1), ($strMSIFullName.Length - ($strMSIFullName.LastIndexOf("\") + 1)))
-    $DestFolderCollection = Invoke-Command -ComputerName $strComputerName { Get-Item env:TEMP }
+    $DestFolderCollection = Invoke-CommandWithRetry -ComputerName $strComputerName -ScriptBlock { Get-Item env:TEMP }
     $LocalMSI = Join-Path $DestFolderCollection.Value $strMSIName
     $DestFolder = Join-Path \\$strComputerName $DestFolderCollection.Value
     $DestFolder = $DestFolder -replace ":", "$"
@@ -320,13 +459,9 @@ function InstallMSI([string] $strComputerName, [string] $strMSIFullName, $arrPar
     $strUNCMSIName = Join-Path $DestFolder $strMSIName
     if ($arrParameters.Count -gt 0) {
         Write-Host "[InstallMSI] Attempting to install:" $strMSIFullName "on:" $strComputerName "with the following parameters:"
+        
         foreach ($strParameter in $arrParameters) {
-            if (($strParameter.ToLower().Contains("password")) -or ($strParameter.ToLower().Contains("pswd")) -or ($strParameter.ToLower().Contains("pass"))) {
-                Write-Host "    "$strParameter.Split("=")[0]
-            }
-            else {
-                Write-Host "    " $strParameter
-            }
+            Write-Host "    " (Format-ParameterForLogging -Parameter $strParameter)
             $strAllParameters = $strAllParameters + " " + $strParameter.replace('%','%%')
         }
     }
@@ -382,7 +517,7 @@ function InstallMSI([string] $strComputerName, [string] $strMSIFullName, $arrPar
         if ($CredSSPEnabled -eq $true) {
             Write-Host "[InstallMSI] Performing CredSSP authentication installation..."
             try {
-                 $Result = Invoke-Command -Computer $strComputerName -ScriptBlock { Start-Process -FilePath $using:strLocalInstallScript -Verb runAs -Wait } -Authentication CredSSP -Credential $Credential -ErrorAction Stop
+                 $Result = Invoke-Command -ComputerName $strComputerName -ScriptBlock { Start-Process -FilePath $using:strLocalInstallScript -Verb runAs -Wait } -Authentication CredSSP -Credential $Credential -ErrorAction Stop
             }
             catch {
                 Throw "[InstallMSI] Failed to establish remote PS session to $strComputerName using CredSSP authentication."
@@ -393,7 +528,7 @@ function InstallMSI([string] $strComputerName, [string] $strMSIFullName, $arrPar
             $Script = "&$strLocalInstallScript"
             $ScriptBlock = $executioncontext.invokecommand.NewScriptBlock($Script)
 
-            $Result = Invoke-Command -Computer $strComputerName -ScriptBlock $ScriptBlock
+            $Result = Invoke-Command -ComputerName $strComputerName -ScriptBlock $ScriptBlock
         }
 
         Start-Sleep -Seconds 10
@@ -435,7 +570,7 @@ function InstallMSI([string] $strComputerName, [string] $strMSIFullName, $arrPar
                 }
             }
             else {
-                Write-Host "[InstallMSI] Susccess criteria couldn't be found in the MSI log file..."
+                Write-Host "[InstallMSI] Success criteria couldn't be found in the MSI log file..."
                 if ($bolExtraAnalysis) {
                     $oErrorsFile = Get-ChildItem -Path $outputFolder -Filter "*_Errors.txt"
                     write-host "[WiLogUtl] Importing" $oErrorsFile.FullName
@@ -469,17 +604,19 @@ function GACAdder([string] $strAction, [string] $strServer, [string] $strLibrary
     `$publish.$strGACFunction('$strLibrary')
 "@
     $ScriptBlock = $executioncontext.invokecommand.NewScriptBlock($Script)
-    $Result = Invoke-Command -Computer $strServer -ScriptBlock $ScriptBlock | Out-Host
+    $Result = Invoke-Command -ComputerName $strServer -ScriptBlock $ScriptBlock | Out-Host
     Write-Host $Result
 }
 
 function GetDbInfoByTypeForEnv([string] $strEnvironment, [string] $strType) {
-    $securePassword = ConvertTo-SecureString $DorcApiAccessPassword -AsPlainText -Force
-    $credentials = New-Object System.Management.Automation.PSCredential ($DorcApiAccessAccount, $securePassword)
+    $DOrcToken = Get-DorcToken 
+    $DorcAPIHeaders = @{
+        "Authorization" = "Bearer $DOrcToken" 
+    }
     $uri=$RefDataApiUrl + 'RefDataEnvironments?env=' + $strEnvironment
-    $EnvId=(Invoke-RestMethod -Uri $uri -method Get -Credential $credentials -ContentType 'application/json').EnvironmentId
+    $EnvId=(Invoke-RestMethod -Uri $uri -method Get -Headers $DorcAPIHeaders -ContentType 'application/json').EnvironmentId
     $uri=$RefDataApiUrl + 'RefDataEnvironmentsDetails/' + $EnvId
-    $table=Invoke-RestMethod -Uri $uri -method Get -Credential $credentials -ContentType 'application/json'
+    $table=Invoke-RestMethod -Uri $uri -method Get -Headers $DorcAPIHeaders -ContentType 'application/json'
     $table=$table.DbServers | Where-Object {$_.Type -eq $strType} | Select-Object Name, ServerName
     $strResult="Invalid"
     if ($table.Name.count -eq 0) {
@@ -913,7 +1050,7 @@ function Stop-Services {
         $strRemServiceName = $null
         $strRemServiceStatus = $null
         $strServiceNameGen = $strService + "*"
-        $oService = Get-Service $strServiceNameGen -computer $strComputer | Select-Object -First 1 #ensure only 1 service processed at a time
+        $oService = Invoke-Command -ComputerName $strComputer -ScriptBlock { param($svc) Get-Service $svc } -ArgumentList $strServiceNameGen | Select-Object -First 1 #ensure only 1 service processed at a time
         $strRemServiceName = $oService.Name
         $strRemServiceStatus = $oService.Status
         $oService = $null
@@ -925,17 +1062,17 @@ function Stop-Services {
                     write-host "      Attempt to stop number:" ($i + 1)
                     Invoke-Command -ComputerName $strComputer { param($strService) Stop-Service $strService -Force} -Args $strService
                     Start-Sleep $retryTime
-                    $oService = Get-Service $strRemServiceName -computer $strComputer
+                    $oService = Invoke-Command -ComputerName $strComputer -ScriptBlock { param($svc) Get-Service $svc } -ArgumentList $strRemServiceName
                     $strRemServiceStatus = $oService.Status
                     if ($strRemServiceStatus -eq "Stopped") {break}
                     if ($i -eq $retryCount) {
                         $ServicePID = $null
-                        $ServicePID = (get-wmiobject win32_service -computername $strComputer | Where-Object { $_.name -eq $strService}).processID
+                        $ServicePID = (Get-CimInstance -ClassName Win32_Service -ComputerName $strComputer -Filter "Name='$strService'").ProcessId
                         write-host "      Killing PID:" $ServicePID
                         Invoke-Command -ComputerName $strComputer {param($ServicePID) Stop-Process $ServicePID -Force} -Args $ServicePID -ErrorAction SilentlyContinue
                     }
                 }
-                $oService = Get-Service $strRemServiceName -computer $strComputer
+                $oService = Invoke-Command -ComputerName $strComputer -ScriptBlock { param($svc) Get-Service $svc } -ArgumentList $strRemServiceName
                 $strRemServiceStatus = $oService.Status
                 if ($strRemServiceStatus -ne "Stopped") {throw "    " + $strRemServiceName + "is still" + $oService.Status}
                 else {write-host "   "$strRemServiceName "has been stopped"}
@@ -955,17 +1092,17 @@ function StartServices($arrServiceList, [string] $strComputer) {
         $strRemServiceName = $null
         $strRemServiceStatus = $null
         $strServiceNameGen = $strService + "*"
-        $oService = Get-Service $strServiceNameGen -computer $strComputer
+        $oService = Invoke-Command -ComputerName $strComputer -ScriptBlock { param($svc) Get-Service $svc } -ArgumentList $strServiceNameGen
         $strRemServiceName = $oService.Name
         $strRemServiceStatus = $oService.Status
         $oService = $null
         if ($strRemServiceName -eq $strService) {
             if ($strRemServiceStatus -eq "Stopped") {
                 Write-Host "    Starting" $strService "on" $strComputer
-                Get-WmiObject -Class win32_service -Filter "Name = '$($strService)'"-ComputerName $strComputer -EnableAllPrivileges | Invoke-WmiMethod -Name StartService -ErrorAction Stop
+                Invoke-Command -ComputerName $strComputer -ScriptBlock { param($svc) Start-Service $svc } -ArgumentList $strService -ErrorAction Stop
                 start-sleep -Seconds 5
                 For ($i=0; $i -le 10; $i++) {
-                    $oService = Get-Service $strServiceNameGen -computer $strComputer
+                    $oService = Invoke-Command -ComputerName $strComputer -ScriptBlock { param($svc) Get-Service $svc } -ArgumentList $strServiceNameGen
                     $strRemServiceStatus = $oService.Status
                     If ($strRemServiceStatus -eq "Running") {write-host "Running";break}
                     Write-Host "    wait 10 seconds"
@@ -988,8 +1125,13 @@ function RunMTMTests($arrParameters) {
     $bolReturn = $false
     if ($arrParameters.Count -gt 0) {
         foreach ($strParameter in $arrParameters) {
-            Write-Host "Setting" $strParameter.Split("=")[0] "to:" $strParameter.Split("=")[1]
-            Set-Variable -Name  $strParameter.Split("=")[0] -Value $strParameter.Split("=")[1]
+            $parameterName = $strParameter.Split("=")[0]
+            $parameterValue = $strParameter.Split("=")[1]
+            
+            $safeDisplay = Format-ParameterForLogging -Parameter $strParameter
+            Write-Host "Setting $safeDisplay"
+            
+            Set-Variable -Name $parameterName -Value $parameterValue
         }
         ## Sync
         $UpdateParams = " testcase /import /collection:" + $TFSInstance + " /teamproject:" + $TFSTeamProject + " /storage:" + $TestDll + " /syncsuite:" + $TestSuite
@@ -1058,7 +1200,7 @@ function Start-Services {
     )
     foreach ($strService in $arrServiceList) { 
         $oService = $null
-        $oService = Get-Service $strService -computer $strComputer -ErrorAction SilentlyContinue
+        $oService = Invoke-Command -ComputerName $strComputer -ScriptBlock { param($svc) Get-Service $svc -ErrorAction SilentlyContinue } -ArgumentList $strService
         if ($oService) {
             if ($oService.Status -eq "Running") {Write-Host "   "$strService "on" $strComputer "is" $oService.Status", nothing to do..."}
             else {
@@ -1067,10 +1209,10 @@ function Start-Services {
                      Write-host "      Attempt to start number:" ($i + 1)
                      Invoke-Command -ComputerName $strComputer { param($strService) Start-Service $strService -ErrorAction SilentlyContinue} -Args $strService          
                      Start-Sleep $retryTime
-                     $oService = Get-Service $strService -computer $strComputer
+                     $oService = Invoke-Command -ComputerName $strComputer -ScriptBlock { param($svc) Get-Service $svc } -ArgumentList $strService
                      if ($oService.Status -eq "Running") {break}            
                 }
-                $oService = Get-Service $strService -computer $strComputer
+                $oService = Invoke-Command -ComputerName $strComputer -ScriptBlock { param($svc) Get-Service $svc } -ArgumentList $strService
                 if ($oService.Status -ne "Running") {throw "    " + $strService + "is still " + $oService.Status}
                 else {Write-host "   "$strService "has been started"}
             }            
@@ -1126,8 +1268,8 @@ function Restart-Servers {
     foreach	($TargetServer in $TargetServers) {
         $LastBootUpTime = $null
         try {
-            $wmi = Get-WmiObject -Class Win32_OperatingSystem -Computer $TargetServer -ErrorAction Stop
-            $LastBootUpTime = $wmi.ConvertToDateTime($wmi.LastBootUpTime)
+            $wmi = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $TargetServer -ErrorAction Stop
+            $LastBootUpTime = $wmi.LastBootUpTime
         }
         catch {
             Write-Error $_ | out-string
@@ -1141,7 +1283,7 @@ function Restart-Servers {
         try {
             #reboot computer using WMI reboot method is more reliable than Restart-Computer
             Write-host "Rebooting $TargetServer using WMI"
-            Get-WmiObject Win32_OperatingSystem -ComputerName $TargetServer -EnableAllPrivileges -ErrorAction Stop | Invoke-WmiMethod -Name reboot -ErrorAction Stop | Out-Null
+            Invoke-CimMethod -ClassName Win32_OperatingSystem -ComputerName $TargetServer -MethodName reboot -ErrorAction Stop | Out-Null
         }
         catch {
             #last resort - use shutdown.exe
@@ -1169,11 +1311,11 @@ function Restart-Servers {
             #Check uptime
             $10min = New-TimeSpan -Minutes 10
             try {
-                $wmi = Get-WmiObject -Class Win32_OperatingSystem -Computer $TargetServer -ErrorAction Stop
-                $LastBootUpTime = $wmi.ConvertToDateTime($wmi.LastBootUpTime)
+                $wmi = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $TargetServer -ErrorAction Stop
+                $LastBootUpTime = $wmi.LastBootUpTime
             }
             catch {
-                Write-verbose "WMI not yet available on server [$TargetServer]"
+                Write-verbose "CIM not yet available on server [$TargetServer]"
                 $LastBootUpTime = Get-Date 01/01/1900 #set way in past to fail the condition inside "until"
             }
                 
@@ -1193,13 +1335,16 @@ function Restart-Servers {
 }
 
 function GetServersOfType([string] $strEnvironment, [string] $strType = "") {	
-    $securePassword = ConvertTo-SecureString $DorcApiAccessPassword -AsPlainText -Force
-    $credentials = New-Object System.Management.Automation.PSCredential ($DorcApiAccessAccount, $securePassword)
+    $DOrcToken = Get-DorcToken 
+    $DorcAPIHeaders = @{
+        "Authorization" = "Bearer $DOrcToken" 
+    }
+    
     $uri=$RefDataApiUrl + 'RefDataEnvironments?env=' + $strEnvironment	
-    $EnvInfo = Invoke-RestMethod -Uri $uri -method Get -Credential $credentials -ContentType 'application/json'
+    $EnvInfo = Invoke-RestMethod -Uri $uri -method Get -Headers $DorcAPIHeaders -ContentType 'application/json'
     $EnvId = $EnvInfo.EnvironmentId
     $uri = $RefDataApiUrl + 'RefDataEnvironmentsDetails/' + $EnvId	
-    $EnvDetailsInfo = Invoke-RestMethod -Uri $uri -method Get -Credential $credentials -ContentType 'application/json'
+    $EnvDetailsInfo = Invoke-RestMethod -Uri $uri -method Get -Headers $DorcAPIHeaders -ContentType 'application/json'
     $Servers=$EnvDetailsInfo.AppServers.Name
     $table=new-object "System.Data.DataTable"
     $ColumnNames='Env_ID','Env_Name','Owner','Thin_Client_Server','Restored_From_Backup','Last_Update','File_Share','Env_Note','Description','Build_ID','Locked','Env_ID1','Server_ID','Server_ID1','Server_Name','OS_Version','Application_Server_Name'
@@ -1293,10 +1438,27 @@ function BuildServersOfType([string] $strEnvironment, [string] $strServers, [str
     return @(, $ServerInfoResult)
 }
 
-function DeployDACPAC([string] $sqlPackagePath, [string] $strInstance, [string] $strDatabase, [string] $strDACPAC, [string] $strPublishProfile, [array] $arrVariables, [string] $strBlackList, [string] $strRollbackMode = "None",[string] $EnvironmentPostScript="") {
+function DeployDACPAC([string] $sqlPackagePath, [string] $strInstance, [string] $strDatabase, [string] $strDACPAC, [string] $strPublishProfile, [array] $arrVariables, [string] $strBlackList, [string] $strRollbackMode = "None",[string] $EnvironmentPostScript="", [int] $QueryTimeout = 0) {
     Import-Module SqlServer -DisableNameChecking
     #TODO If database doesn't exist skip check for alter
     #TODO Database.WhiteList.xml in DevTools
+
+    # Resolve the SQL query timeout used for the pre/post custom SQL scripts.
+    # Precedence: explicit $QueryTimeout param > DACPACQueryTimeout DOrc property > code default (3600s).
+    if ($QueryTimeout -le 0) {
+        $QueryTimeout = 3600
+        $propQueryTimeout = Get-Variable -Name 'DACPACQueryTimeout' -ValueOnly -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($propQueryTimeout)) {
+            $parsedQueryTimeout = 0
+            if ([int]::TryParse([string]$propQueryTimeout, [ref]$parsedQueryTimeout) -and $parsedQueryTimeout -gt 0) {
+                $QueryTimeout = $parsedQueryTimeout
+            }
+            else {
+                Write-Host "****WARNING: DACPACQueryTimeout value '$propQueryTimeout' is not a positive integer. Using default $QueryTimeout.****"
+            }
+        }
+    }
+    Write-Host "SQL query timeout: $QueryTimeout seconds (pre/post custom SQL scripts)"
 	
     Write-Host "Variables:       " $arrVariables.Count
     $strVariables = ""
@@ -1321,7 +1483,7 @@ function DeployDACPAC([string] $sqlPackagePath, [string] $strInstance, [string] 
             # If Present check and process PreSQL
             if (Test-Path $strRollbackDataSQLFile) {
                 Write-Host "Checking:        " $strRollbackDataSQLFile
-                $preResult = CheckAndApplySQL $strInstance $strDatabase $strRollbackDataSQLFile $strBlackList
+                $preResult = CheckAndApplySQL $strInstance $strDatabase $strRollbackDataSQLFile $strBlackList $QueryTimeout
                 if (!$preResult) {
                     throw "Error applying Rollback sql"
                 }
@@ -1337,7 +1499,7 @@ function DeployDACPAC([string] $sqlPackagePath, [string] $strInstance, [string] 
             # If Present check and process PreSQL
             if (Test-Path $strPreSQLFile) {
                 Write-Host "Checking:        " $strPreSQLFile
-                $preResult = CheckAndApplySQL $strInstance $strDatabase $strPreSQLFile $strBlackList
+                $preResult = CheckAndApplySQL $strInstance $strDatabase $strPreSQLFile $strBlackList $QueryTimeout
                 if (!$preResult) {
                     throw "Error applying pre-sql"
                 }
@@ -1373,7 +1535,7 @@ function DeployDACPAC([string] $sqlPackagePath, [string] $strInstance, [string] 
             Write-Host ""
             if (Test-Path $strPostSQLFile) {
                 Write-Host "Checking:        " $strPostSQLFile
-                $preResult = CheckAndApplySQL $strInstance $strDatabase $strPostSQLFile $strBlackList
+                $preResult = CheckAndApplySQL $strInstance $strDatabase $strPostSQLFile $strBlackList $QueryTimeout
                 if (!$preResult) {
                     throw "Error applying post-sql"
                 }
@@ -1387,7 +1549,7 @@ function DeployDACPAC([string] $sqlPackagePath, [string] $strInstance, [string] 
                 # If Present check and process ApplyDataChangeSql
                 if (Test-Path $strApplyDataSQLFile) {
                     Write-Host "Checking:        " $strApplyDataSQLFile
-                    $preResult = CheckAndApplySQL $strInstance $strDatabase $strApplyDataSQLFile $strBlackList
+                    $preResult = CheckAndApplySQL $strInstance $strDatabase $strApplyDataSQLFile $strBlackList $QueryTimeout
                     if (!$preResult) {
                         throw "Error applying Data Changes-sql"
                     }
@@ -1401,7 +1563,7 @@ function DeployDACPAC([string] $sqlPackagePath, [string] $strInstance, [string] 
 					 if (Test-Path $strEnvironmentPostSQLFile)
 					 {
 						 Write-Host "Checking:        " $strEnvironmentPostSQLFile
-						 $preResult = CheckAndApplySQL $strInstance $strDatabase $strEnvironmentPostSQLFile $strBlackList
+						 $preResult = CheckAndApplySQL $strInstance $strDatabase $strEnvironmentPostSQLFile $strBlackList $QueryTimeout
 						 if (!$preResult)
 						 {
 							 throw "Error applying $strEnvironmentPostSQLFile-sql"
@@ -1517,7 +1679,7 @@ function ActionDACPAC([string] $strAction, [string] $sqlPackagePath, [string] $s
     return $bolReturn
 }
 
-function CheckAndApplySQL([string] $strInstance, [string] $strDatabase, [string] $strSQLFile, [string] $strBlackList) {
+function CheckAndApplySQL([string] $strInstance, [string] $strDatabase, [string] $strSQLFile, [string] $strBlackList, [int] $QueryTimeout = 3600) {
     $bolReturn = $false
     $bolBlackStatements = $false	
     if ($strBlackList.Length -gt 0) {
@@ -1546,7 +1708,7 @@ function CheckAndApplySQL([string] $strInstance, [string] $strDatabase, [string]
         if (!$bolBlackStatements) {
             Write-Host "Applying:        " $strSQLFile
             try {
-                Invoke-Sqlcmd -ServerInstance $strInstance -Database $strDatabase -InputFile $strSQLFile  -QueryTimeout 3600 -TrustServerCertificate -ErrorAction 'Stop' -Verbose 
+                Invoke-Sqlcmd -ServerInstance $strInstance -Database $strDatabase -InputFile $strSQLFile  -QueryTimeout $QueryTimeout -TrustServerCertificate -ErrorAction 'Stop' -Verbose 
                 $bolReturn = $true
             }
             catch {
@@ -1634,7 +1796,7 @@ function InstFeature([string] $strComputerName, [string] $strFeature, [bool] $bo
         Invoke-Command -session $session {$ProgressPreference = "SilentlyContinue"}
         Invoke-Command -session $session {net use * $($args[0]) $($args[1]) /user:$($args[2]) 2>&1>null} -ArgumentList $strSourceSxSFolder, $DeploymentServiceAccountPassword, $DeploymentServiceAccount
         if ($bolAllSubFeatures) {	
-            if (((Get-WmiObject Win32_OperatingSystem -ComputerName $strComputerName).Name).Contains("2012")) {
+            if (((Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $strComputerName).Name).Contains("2012")) {
                 Invoke-Command -session $session {Install-WindowsFeature -Name $($args[0]) -IncludeAllSubFeature -Source $($args[1]) | Out-Null} -ArgumentList $strFeature, $strSourceSxSFolder
             }
             else {
@@ -1642,7 +1804,7 @@ function InstFeature([string] $strComputerName, [string] $strFeature, [bool] $bo
             }
         }
         else {
-            if (((Get-WmiObject Win32_OperatingSystem -ComputerName $strComputerName).Name).Contains("2012")) {
+            if (((Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $strComputerName).Name).Contains("2012")) {
                 Invoke-Command -session $session {Install-WindowsFeature -Name $($args[0]) -Source $($args[1]) | Out-Null} -ArgumentList $strFeature, $strSourceSxSFolder
             }
             else {                
@@ -1664,7 +1826,7 @@ function UnInstFeature([string] $strComputerName, [string] $strFeature, [bool] $
     if (CheckFeature $strComputerName $strFeature) {
         Write-Host "    Uninstalling:" $strFeature
         Invoke-Command -session $session {$ProgressPreference = "SilentlyContinue"}
-        if ( ((Get-WmiObject Win32_OperatingSystem -ComputerName $strComputerName).Name).Contains("2012")) {
+        if ( ((Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $strComputerName).Name).Contains("2012")) {
             Invoke-Command -session $session {Uninstall-WindowsFeature -Name $($args[0]) | Out-Null} -ArgumentList $strFeature
         }
         else {
@@ -2149,9 +2311,19 @@ Function DeployMSI {
         [Switch]$NoLogoffUsers
     )
     try {
-    	   Start-Sleep -s 10
+        # Bounded wait for the drop folder / MSI to become available, replacing a
+        # legacy unconditional 'Start-Sleep -s 10'. Returns as soon as the MSI is
+        # found; only waits (up to $DropFolderMaxWaitSeconds) when it isn't yet there.
+        $DropFolderMaxWaitSeconds = 10
+        $DropFolderPollSeconds = 1
+        $DropFolderWaited = 0
+        $msiFiles = @(Get-ChildItem -Path $DropFolder -Include $MSIFile -Recurse -ErrorAction SilentlyContinue)
+        while ($msiFiles.Count -eq 0 -and $DropFolderWaited -lt $DropFolderMaxWaitSeconds) {
+            Start-Sleep -Seconds $DropFolderPollSeconds
+            $DropFolderWaited += $DropFolderPollSeconds
+            $msiFiles = @(Get-ChildItem -Path $DropFolder -Include $MSIFile -Recurse -ErrorAction SilentlyContinue)
+        }
 
-        $msiFiles = Get-ChildItem -Path $DropFolder -Include $MSIFile -Recurse        
         if ($msiFiles.Count -eq 0) {
             throw "[ERROR][DeployMSI][$(Get-Date)] Could not find any files named $($MSIFile) in $DropFolder"
         }
@@ -2468,38 +2640,48 @@ function GetSQLServerName([string] $strInstance) {
 function Invoke-RemoteProcess([string] $serverName, [string] $strExecutable, [string] $strParams = "", [string] $strUser = "", [string] $strPassword = "", [switch]$IgnoreStdErr) {
     $bolResult = $true
     $strExecutableChild = $null
-    # Test for UNC to executable then check for user / password
-    $bolCredsOK = $false
+
+    # If the caller appended a child-process marker (e.g. NSIS ";Au_"), split
+    # it off up-front so later UNC handling sees a clean path.
+    if ($strExecutable.Contains(";")) {
+        $strExecutableChild = $strExecutable.Split(";")[1]
+        $strExecutable = $strExecutable.Split(";")[0]
+    }
+
+    # UNC inputs are staged onto the target via Copy-Item -ToSession further
+    # down. That streams bytes over the WinRM channel using the client's own
+    # identity, so the target never needs to reach back over SMB. This avoids
+    # the Windows double-hop problem (net use with explicit /user: from within
+    # a Network logon session fails with ERROR_NO_SUCH_LOGON_SESSION when the
+    # share is DFS-backed). $strUser / $strPassword are retained in the
+    # signature for backward-compatibility but are no longer consulted for UNC
+    # inputs.
+    $uncInput = $null
     if ($strExecutable.StartsWith("\\")) {
-        write-host "    UNC path has been detected, checking for username / password parameters..."
-        if ([String]::IsNullOrEmpty($strUser) -or [String]::IsNullOrEmpty($strPassword)) {
-            Write-Host "    Cannot continue as remote machine will be unable to connect out without credentials..."
-            $bolResult = $false
-        }
-        else {
-            $uncShare =  $strExecutable.SubString(0, $strExecutable.LastIndexOf("\"))
-            $strExecutable = $strExecutable.Replace($uncShare, "")
-            $uncShare = [char]34 + $uncShare + [char]34
-            write-host "    UNC Share: " $uncShare
-            write-host "    Executable:" $strExecutable
-            $bolCredsOK = $true
-        }
+        write-host "    UNC path detected - will stage on target via PSSession:" $strExecutable
+        $uncInput = $strExecutable
     }
-    else {
-        $bolCredsOK = $true
-    }
-    if ($bolCredsOK) {
-        $session = New-PSSession -ComputerName $ServerName
-        if ($strExecutable.Contains(";")) {
-            $strExecutableChild = $strExecutable.Split(";")[1]
-            $strExecutable = $strExecutable.Split(";")[0]
-        }
-        if ($strExecutable.StartsWith("\")) {
-            # Need to connect out...
-            Invoke-Command -session $session {net use * /d /y 2>&1>null}
-            Invoke-Command -session $session {net use S: $($args[0]) $($args[1]) /user:$($args[2]) 2>&1>null} -ArgumentList $uncShare, $strPassword, $strUser
-            $strExecutable = "S:" + $strExecutable
-            write-host "    Executable:" $strExecutable
+
+    $session = New-PSSession -ComputerName $ServerName
+    $stagedRemotePath = $null
+    try {
+        if ($uncInput) {
+            # Resolve the target's TEMP directory rather than hard-coding
+            # C:\Windows\Temp — Windows can be installed on a different drive
+            # and %TEMP% on a service account is typically what we want anyway.
+            $remoteTempDir = Invoke-Command -session $session { $env:TEMP }
+            if ([string]::IsNullOrEmpty($remoteTempDir)) { $remoteTempDir = 'C:\Windows\Temp' }
+            $stagedRemotePath = [IO.Path]::Combine($remoteTempDir, "dorc-" + [guid]::NewGuid().ToString('N') + "-" + [IO.Path]::GetFileName($uncInput))
+            write-host "    Staging to target at:" $stagedRemotePath
+            try {
+                Copy-Item -ToSession $session -Path $uncInput -Destination $stagedRemotePath -Force -ErrorAction Stop
+            } catch {
+                write-host "    Copy-Item -ToSession failed:" $_.Exception.Message
+                $bolResult = $false
+                return $bolResult
+            }
+            $strExecutable = $stagedRemotePath
+            write-host "    Executable (staged):" $strExecutable
         }
         $result = Invoke-Command -session $session {$result = $false; if (Test-Path -Path $($args[0]) -PathType Leaf) { $result = $true }; return $result} -ArgumentList $strExecutable
         if ($result) {
@@ -2555,17 +2737,34 @@ function Invoke-RemoteProcess([string] $serverName, [string] $strExecutable, [st
         }
         else {
             write-host "    Unable to find:" $strExecutable "from" $ServerName
+            $bolResult = $false
         }
-        if ($strExecutable.StartsWith("\\")) {Invoke-Command -session $session {net use * /d /y 2>&1>null}}
-        Remove-PSSession $session
+    } finally {
+        if ($stagedRemotePath) {
+            try {
+                Invoke-Command -session $session { Remove-Item -Path $($args[0]) -Force -ErrorAction SilentlyContinue } -ArgumentList $stagedRemotePath | Out-Null
+            } catch { }
+        }
+        # Session teardown can throw if the session has already faulted;
+        # swallow to keep the real execution result intact.
+        try { Remove-PSSession $session -ErrorAction SilentlyContinue } catch { }
     }
     write-host "bolResult:" $bolResult
     return $bolResult
 }
 
+function Open-RemoteRegistryHive([string] $serverName) {
+    return [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $serverName)
+}
+
+function Test-IsRunningAsAdministrator {
+    $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Find-RemoteNSIS([string] $serverName, [string] $productString) {
     $strUninstallString = "None"
-    $Reg = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $serverName)
+    $Reg = Open-RemoteRegistryHive $serverName
     $RegKey_x32 = $Reg.OpenSubKey("SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall")
     $RegKey_x64 = $Reg.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall")
     foreach ($subKeyName in $RegKey_x32.GetSubKeyNames()) {
@@ -2583,14 +2782,21 @@ function Find-RemoteNSIS([string] $serverName, [string] $productString) {
         }
     }
     $erlangKey, $RegKey_x32, $RegKey_x64, $Reg = $null
-    return $strUninstallString
+    if ([string]::IsNullOrEmpty($strUninstallString)) { return "None" }
+    return $strUninstallString.Trim('"')
 }
 
 function Remove-NSISErlang([string] $serverName) {
-    $arrDirectories = New-Object System.Collections.ArrayList($null) 
+    $arrDirectories = New-Object System.Collections.ArrayList($null)
     $remErlang = Find-RemoteNSIS $serverName "Erlang"
+    $maxAttempts = 5
+    $attempts = 0
     do {
         if ($remErlang -ne "None") {
+            if ($attempts -ge $maxAttempts) {
+                throw "Remove-NSISErlang: exceeded $maxAttempts attempts on $serverName; uninstall string '$remErlang' still present after each attempt. The uninstall registry entry may be stale (pointing at a file that no longer exists)."
+            }
+            $attempts++
             write-host "    Uninstall string:" $remErlang
             $remErlang += ";Au_"
             $bolResult = (Invoke-RemoteProcess $serverName $remErlang "/S")[0]
@@ -2611,10 +2817,16 @@ function Remove-NSISErlang([string] $serverName) {
 }
 
 function Remove-NSISRabbitMQ([string] $serverName) {
-    $arrDirectories = New-Object System.Collections.ArrayList($null) 
+    $arrDirectories = New-Object System.Collections.ArrayList($null)
     $remRabbit = Find-RemoteNSIS $serverName "RabbitMQ"
+    $maxAttempts = 5
+    $attempts = 0
     do {
         if ($remRabbit -ne "None") {
+            if ($attempts -ge $maxAttempts) {
+                throw "Remove-NSISRabbitMQ: exceeded $maxAttempts attempts on $serverName; uninstall string '$remRabbit' still present after each attempt. The uninstall registry entry may be stale (pointing at a file that no longer exists)."
+            }
+            $attempts++
             write-host "    Uninstall string:" $remRabbit
             $remRabbit += ";Au_"
             $bolResult = (Invoke-RemoteProcess $serverName $remRabbit "/S")[0]
@@ -2698,15 +2910,17 @@ function Get-EndurDbVersion
 }
 
 function GetDbInfoByTypeForEnvWithArray([string] $strEnvironment, [string] $strType) {
-    $securePassword = ConvertTo-SecureString $DorcApiAccessPassword -AsPlainText -Force
-    $credentials = New-Object System.Management.Automation.PSCredential ($DorcApiAccessAccount, $securePassword)
+    $DOrcToken = Get-DorcToken 
+    $DorcAPIHeaders = @{
+        "Authorization" = "Bearer $DOrcToken" 
+    }
     $uri=$RefDataApiUrl + 'RefDataEnvironments?env=' + $strEnvironment
 	write-host "GetDbInfoByTypeForEnvWithArray Uri is:" $uri
-    $EnvId=(Invoke-RestMethod -Uri $uri -method Get -Credential $credentials -ContentType 'application/json').EnvironmentId
+    $EnvId=(Invoke-RestMethod -Uri $uri -method Get -Headers $DorcAPIHeaders -ContentType 'application/json').EnvironmentId
 	write-host "EnvId" $EnvId 
     $uri=$RefDataApiUrl + 'RefDataEnvironmentsDetails/' + $EnvId
 	write-host "EnvironmentDetails Uri is:" $uri
-    $table=Invoke-RestMethod -Uri $uri -method Get -Credential $credentials -ContentType 'application/json'
+    $table=Invoke-RestMethod -Uri $uri -method Get -Headers $DorcAPIHeaders -ContentType 'application/json'
     $table=$table.DbServers | where {$_.Type -eq $strType} | Select Name, ServerName, ArrayName
     $strResult="Invalid"
     if ($table.Name.count -eq 0) {
@@ -2805,7 +3019,7 @@ function Check-ProductInstalled
 )
 {
     $installed = $false
-    $products = Get-WmiObject Win32_Product -ComputerName $serverName
+    $products = Get-CimInstance -ClassName Win32_Product -ComputerName $serverName
     foreach ($product in $products) { if ($product.Name.ToLower() -eq $productName.ToLower()) { $installed = $true } }
     $products = $null
     return $installed
@@ -2827,7 +3041,7 @@ function Install-WindowsFeaturesDorc
         foreach ($Row in $ServerInfo) {
             $serverName = $Row.Server_Name.Trim()
             $serverType = $Row.Application_Server_Name.Trim()
-            $remOS = Get-WmiObject Win32_OperatingSystem -ComputerName $serverName
+            $remOS = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $serverName
             if ($remOS.Name -match "2008") {
                 write-host "[Install-WindowsFeaturesDorc] Target server O/S is 2008, skipping:" $serverName
             }
@@ -3163,6 +3377,12 @@ function Set-SSISPackageParamters
     $catalog = $integrationServices.Catalogs.get_Item($ssisDb)
     $folder = $catalog.Folders[$environment]
     $envVarsSet = $false
+    
+    $DOrcToken = Get-DorcToken 
+    $DorcAPIHeaders = @{
+        "Authorization" = "Bearer $DOrcToken" 
+    }
+
     if ($catalog.Name.ToLower() -eq $ssisDb.ToLower()) {
         $isConfigs = Get-Childitem $packageFolderRoot -Recurse -File -Filter *.json
         if ($isConfigs.Count -gt 0) {
@@ -3180,7 +3400,7 @@ function Set-SSISPackageParamters
                                     $value = (get-variable $jsonParameter.DeployProperty -ErrorAction SilentlyContinue -WarningAction SilentlyContinue).Value
                                     $url = $DORC_PropertiesUrl #+ $jsonParameter.DeployProperty
                                     $ProgressPreference = "SilentlyContinue"
-                                    $propInfo = Invoke-WebRequest -UseDefaultCredentials $url | ConvertFrom-Json
+                                    $propInfo = Invoke-WebRequest $url -Headers $DorcAPIHeaders -UseBasicParsing | ConvertFrom-Json
 									$propInfo = $propInfo|  where {$_.Name -eq $jsonParameter.DeployProperty}
                                     $ProgressPreference = "Continue"
                                     $isSecure = $propInfo.Secure #IsSecured
@@ -3222,7 +3442,7 @@ function Set-SSISPackageParamters
                                     $value = (get-variable $jsonParameter.DeployProperty -ErrorAction SilentlyContinue -WarningAction SilentlyContinue).Value
                                     $url = $DORC_PropertiesUrl #+ $jsonParameter.DeployProperty
                                     $ProgressPreference = "SilentlyContinue"
-                                    $propInfo = Invoke-WebRequest -UseDefaultCredentials $url | ConvertFrom-Json
+                                    $propInfo = Invoke-WebRequest $url -Headers $DorcAPIHeaders -UseBasicParsing | ConvertFrom-Json
 									$propInfo = $propInfo|  where {$_.Name -eq $jsonParameter.DeployProperty}
                                     $ProgressPreference = "Continue"
                                     $isSecure = $propInfo.Secure #IsSecured
@@ -3277,14 +3497,16 @@ function CheckBackup ([string] $SourceInstance, [string] $SourceDB, [string] $Re
         AND ($type) AND msdb.dbo.backupset.server_name = '$realSQLName'
         ORDER BY
         msdb.dbo.backupset.backup_finish_date desc" -ServerInstance "$SourceInstance" -TrustServerCertificate
+	$guidPattern = '^\{?[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\}?$'
 	Write-Host "CheckBackup full path:" $fullbackpath.path
-	if (!([string]::IsNullOrEmpty($fullbackpath))) {
+	if (!([string]::IsNullOrEmpty($fullbackpath.path))) {
+		$fullPathType = if ($fullbackpath.path -match $guidPattern) { 'CommvaultBackup' } else { 'filesharebackup' }
+		Write-Host "CheckBackup full path type:" $fullPathType
 		if ($RestoreMode -eq "latest"){
-			if (Test-Path $fullbackpath.path) { return $true }
-				else {return $false}
+			return [PSCustomObject]@{ IsValid = $true; FullPath = $fullbackpath.path; FullPathType = $fullPathType; IncPath = $null; IncPathType = $null }
 		}
 	}
-	else {return $false}
+	else { return [PSCustomObject]@{ IsValid = $false; FullPath = $null; FullPathType = $null; IncPath = $null; IncPathType = $null } }
     if ($RestoreMode -eq "now" -or $RestoreMode -eq "pit"){
         $type = $inc
         $incbackpath =  Invoke-Sqlcmd -Query "USE master SELECT top(1)
@@ -3297,11 +3519,12 @@ function CheckBackup ([string] $SourceInstance, [string] $SourceDB, [string] $Re
 			ORDER BY
 			msdb.dbo.backupset.backup_finish_date desc" -ServerInstance "$SourceInstance" -TrustServerCertificate
 		Write-Host "CheckBackup inc path:" $incbackpath.path
-		if (!([string]::IsNullOrEmpty($incbackpath))) {
-			if ((Test-Path $fullbackpath.path) -and (Test-Path $incbackpath.path)) { return $true }
-				else {return $false}
+		if (!([string]::IsNullOrEmpty($incbackpath.path))) {
+			$incPathType = if ($incbackpath.path -match $guidPattern) { 'CommvaultBackup' } else { 'filesharebackup' }
+			Write-Host "CheckBackup inc path type:" $incPathType
+			return [PSCustomObject]@{ IsValid = $true; FullPath = $fullbackpath.path; FullPathType = $fullPathType; IncPath = $incbackpath.path; IncPathType = $incPathType }
 		}
-		else {return $false}
+		else { return [PSCustomObject]@{ IsValid = $false; FullPath = $fullbackpath.path; FullPathType = $fullPathType; IncPath = $null; IncPathType = $null } }
     }
     else {
         Write-Warning "Unexpected RestoreMode: $RestoreMode after validation"
@@ -3475,16 +3698,13 @@ Function Get-DorcCredSSPStatus {
     https://blogs.technet.microsoft.com/ashleymcglone/2016/08/30/powershell-remoting-kerberos-double-hop-solved-securely/
     https://support.microsoft.com/en-gb/help/4295591/credssp-encryption-oracle-remediation-error-when-to-rdp-to-azure-vm
     #>
-    
-    
-    #requires -RunAsAdministrator
-        
+
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
-        [String]        
+        [String]
         $ComputerName,
-        
+
         [Parameter(Mandatory = $true)]
         [pscredential]
         $Credential,
@@ -3493,7 +3713,11 @@ Function Get-DorcCredSSPStatus {
         [switch]
         $Test
     )
-    
+
+    if (-not (Test-IsRunningAsAdministrator)) {
+        throw "Get-DorcCredSSPStatus requires the session to be running as Administrator."
+    }
+
     $params = @{}
 
     if ($PSBoundParameters['ComputerName']) {
@@ -4098,6 +4322,7 @@ function Get-AzAccessTokenToResource {
     $AccessTokenToResource = Get-AzAccessToken -ResourceUrl $ResourceUrl
     return $AccessTokenToResource
 }
+
 function DeployDACPACToAzureSQL {
     [CmdletBinding()]
     param (
@@ -4156,3 +4381,38 @@ function DeployDACPACToAzureSQL {
     }
 }
 
+function Get-DorcToken {   
+    $DorcIDSsecret =  $DorcCliSecret
+	
+    if ([string]::IsNullOrWhiteSpace($DorcIDSsecret)) {
+        Write-Error "The DorcIDSsecret is empty or null. Please provide a valid value."
+        return $null
+    }	
+    $IDSHeaders = @{
+        "Content-Type" = "application/x-www-form-urlencoded"
+    }
+
+    try {
+        $DorcApiUrl = if ($RefDataApiUrl) { $RefDataApiUrl } else { "https://deploymentportal:8443" }
+        $DorcApiUrl = $DorcApiUrl.TrimEnd('/')
+        $ApiConfig = Invoke-WebRequest -Uri "$DorcApiUrl/ApiConfig" -UseBasicParsing | ConvertFrom-Json
+        $IDSBaseURL = $ApiConfig.OAuthAuthority + "/connect/token"
+        $ApiScope = ($ApiConfig.OAuthUiRequestedScopes -split ' ' | Where-Object { $_ -like '*.manage' } | Select-Object -First 1)
+        if (-not $ApiScope) { $ApiScope = "dorc-api.manage" }
+        Write-Host "Token endpoint is: $IDSBaseURL"
+        Write-Host "Using scope: $ApiScope"
+        $IDSFormData = @{
+            "grant_type"    = "client_credentials"
+            "client_id"     = "dorc-cli"
+            "client_secret" = "$DorcIDSsecret"
+            "scope"         = "$ApiScope"
+        }
+        $IDSResponse = Invoke-WebRequest -Uri $IDSBaseURL -Method POST -Headers $IDSHeaders -Body $IDSFormData -UseBasicParsing
+        $TokenResponse = $IDSResponse.Content | ConvertFrom-Json        
+        return $TokenResponse.access_token
+    } catch {
+		  Write-Error "Failed to retrieve token. Please check DorcIDSsecret variable value! Error: $_"
+		  Throw
+		  return $null
+    }
+}

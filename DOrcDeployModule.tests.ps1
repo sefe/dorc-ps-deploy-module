@@ -1,6 +1,7 @@
-
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
-Import-Module "$here\DOrcDeployModule.psm1" -ErrorAction Stop
+BeforeAll {
+    $here = Split-Path -Parent $PSCommandPath
+    Import-Module "$here\DOrcDeployModule.psm1" -Force -ErrorAction Stop
+}
 
 Describe "DeleteRabbit Mode Parameter Tests" {
     Context "Valid mode parameter" {
@@ -42,21 +43,30 @@ Describe "CheckBackup RestoreMode Parameter Tests" {
 }
 
 Describe "Get-DorcCredSSPStatus tests" {
-    Context "Computer reachable"{
-        Context "Returns an object with all the expected properties"{
-            $username = "nwtraders\administrator" 
-            $password = "mypassword" | ConvertTo-SecureString -asPlainText -Force
-            $TestCred = New-Object System.Management.Automation.PSCredential($username,$password)
-            #Client CredSSP enabled
-            Mock -CommandName Get-WSManCredSSP -MockWith {return "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is not configured to receive credentials from a remote client computer."}
-            #Server CredSSP enabled, Hotfix vulnerability workaround not in place, e.g. AllowEncryptionOracle value is different to 2
-            Mock -CommandName Get-WmiObject -MockWith {return (New-Object psobject -Property @{"Version"="10.0.17134"; "AllowEncryptionOracle"= 0})}
-            Mock -CommandName Invoke-Command -MockWith {return "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1
-            This computer is configured to receive credentials from a remote client computer."}
-            #Return hotfix not relevant to CredSSP vulnerability
-            Mock Get-MSHotfix {Return (New-Object psobject -Property @{"HotFixID"="KB12345678"})}
+    Context "Computer reachable" {
+
+        Context "Returns an object with all the expected properties" {
+            BeforeAll {
+                $script:TestCred = New-Object System.Management.Automation.PSCredential(
+                    'nwtraders\administrator',
+                    ('mypassword' | ConvertTo-SecureString -AsPlainText -Force))
+
+                Mock -ModuleName DOrcDeployModule Test-IsRunningAsAdministrator { return $true }
+
+                Mock -ModuleName DOrcDeployModule Get-WSManCredSSP {
+                    "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is not configured to receive credentials from a remote client computer."
+                }
+                Mock -ModuleName DOrcDeployModule Get-ServerOSVersion { '10.0.17134' }
+                Mock -ModuleName DOrcDeployModule Invoke-Command {
+                    "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is configured to receive credentials from a remote client computer."
+                }
+                Mock -ModuleName DOrcDeployModule Get-MSHotfix {
+                    New-Object psobject -Property @{ HotFixID = 'KB12345678' }
+                }
+            }
+
             It "Returns an object with all the expected properties" {
-                $result = Get-DorcCredSSPStatus -ComputerName Server1 -Credential $TestCred -Test
+                $result = Get-DorcCredSSPStatus -ComputerName Server1 -Credential $script:TestCred -Test
                 $result.LocalComputerName | Should -Be $Env:COMPUTERNAME
                 $result.RemoteComputerName | Should -Be "SERVER1"
                 $result.LocalOS | Should -Be "10.0.17134"
@@ -65,197 +75,268 @@ Describe "Get-DorcCredSSPStatus tests" {
                 $result.RemoteCredSSPEnabled | Should -Match "true|false"
                 $result.LocalPatchInstalled | Should -Match "true|false"
                 $result.RemotePatchInstalled | Should -Match "true|false"
-                $result.LocalHotFixWorkaroundInPlace | Should -Match "true|false" #can be either depending on local machine it's executed on
+                $result.LocalHotFixWorkaroundInPlace | Should -Match "true|false"
                 $result.RemoteHotFixWorkaroundInPlace | Should -Match "true|false"
                 $result.CredSSPWorks | Should -Match "true|false"
             }
         }
 
-        Context "Credential Delegation Enabled on Client and on Server"{
-            $username = "nwtraders\administrator" 
-            $password = "mypassword" | ConvertTo-SecureString -asPlainText -Force
-            $TestCred = New-Object System.Management.Automation.PSCredential($username,$password)
-            #Client CredSSP enabled
-            Mock -CommandName Get-WSManCredSSP -MockWith {return "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is not configured to receive credentials from a remote client computer."}
-            #Server CredSSP enabled, Hotfix vulnerability workaround not in place, e.g. AllowEncryptionOracle value is different to 2
-            Mock -CommandName Get-WmiObject -MockWith {return (New-Object psobject -Property @{"Version"="10.0.17134"; "AllowEncryptionOracle"= 0})}
-            Mock -CommandName Invoke-Command -MockWith {return "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1
-            This computer is configured to receive credentials from a remote client computer."}
-            #Return hotfix not relevant to CredSSP vulnerability
-            Mock Get-MSHotfix {Return (New-Object psobject -Property @{"HotFixID"="KB12345678"})}
-            
-            It "Returns LocalCredSSPEnabled and RemoteCredSSPEnabled as $true " {
-                $result = Get-DorcCredSSPStatus -ComputerName Server1 -Credential $TestCred
-                $result.LocalCredSSPEnabled | Should -Be $True
-                $result.RemoteCredSSPEnabled | Should -Be $True
+        Context "Credential Delegation Enabled on Client and on Server" {
+            BeforeAll {
+                $script:TestCred = New-Object System.Management.Automation.PSCredential(
+                    'nwtraders\administrator',
+                    ('mypassword' | ConvertTo-SecureString -AsPlainText -Force))
+
+                Mock -ModuleName DOrcDeployModule Test-IsRunningAsAdministrator { return $true }
+
+                Mock -ModuleName DOrcDeployModule Get-WSManCredSSP {
+                    "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is not configured to receive credentials from a remote client computer."
+                }
+                Mock -ModuleName DOrcDeployModule Get-WmiObject {
+                    New-Object psobject -Property @{ Version = '10.0.17134'; AllowEncryptionOracle = 0 }
+                }
+                Mock -ModuleName DOrcDeployModule Invoke-Command {
+                    "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is configured to receive credentials from a remote client computer."
+                }
+                Mock -ModuleName DOrcDeployModule Get-MSHotfix {
+                    New-Object psobject -Property @{ HotFixID = 'KB12345678' }
+                }
+            }
+
+            It "Returns LocalCredSSPEnabled and RemoteCredSSPEnabled as True" {
+                $result = Get-DorcCredSSPStatus -ComputerName Server1 -Credential $script:TestCred
+                $result.LocalCredSSPEnabled | Should -Be $true
+                $result.RemoteCredSSPEnabled | Should -Be $true
             }
         }
-        Context "Credential Delegation NOT enabled on Client"{
-            $username = "nwtraders\administrator" 
-            $password = "mypassword" | ConvertTo-SecureString -asPlainText -Force
-            $TestCred = New-Object System.Management.Automation.PSCredential($username,$password)
-            #Client CredSSP enabled
-            Mock -CommandName Get-WSManCredSSP -MockWith {return "The machine is noy configured to allow delegating fresh credentials.`nThis computer is not configured to receive credentials from a remote client computer."}
-            #Server CredSSP enabled, Hotfix vulnerability workaround not in place, e.g. AllowEncryptionOracle value is different to 2
-            Mock -CommandName Get-WmiObject -MockWith {return (New-Object psobject -Property @{"Version"="10.0.17134"; "AllowEncryptionOracle"= 0})}
-            Mock -CommandName Invoke-Command -MockWith {return "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1
-            This computer is configured to receive credentials from a remote client computer."}
-            #Return hotfix not relevant to CredSSP vulnerability
-            Mock -CommandName Get-MSHotfix -MockWith {Return (New-Object psobject -Property @{"HotFixID"="KB12345678"})}
-            
-            It "Returns LocalCredSSPEnabled as $false" {
-                $result = Get-DorcCredSSPStatus -ComputerName Server1 -Credential $TestCred
+
+        Context "Credential Delegation NOT enabled on Client" {
+            BeforeAll {
+                $script:TestCred = New-Object System.Management.Automation.PSCredential(
+                    'nwtraders\administrator',
+                    ('mypassword' | ConvertTo-SecureString -AsPlainText -Force))
+
+                Mock -ModuleName DOrcDeployModule Test-IsRunningAsAdministrator { return $true }
+
+                Mock -ModuleName DOrcDeployModule Get-WSManCredSSP {
+                    "The machine is not configured to allow delegating fresh credentials.`nThis computer is not configured to receive credentials from a remote client computer."
+                }
+                Mock -ModuleName DOrcDeployModule Get-WmiObject {
+                    New-Object psobject -Property @{ Version = '10.0.17134'; AllowEncryptionOracle = 0 }
+                }
+                Mock -ModuleName DOrcDeployModule Invoke-Command {
+                    "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is configured to receive credentials from a remote client computer."
+                }
+                Mock -ModuleName DOrcDeployModule Get-MSHotfix {
+                    New-Object psobject -Property @{ HotFixID = 'KB12345678' }
+                }
+            }
+
+            It "Returns LocalCredSSPEnabled as False" {
+                $result = Get-DorcCredSSPStatus -ComputerName Server1 -Credential $script:TestCred
                 $result.LocalCredSSPEnabled | Should -Be $false
             }
         }
 
-        Context "Credential Delegation enabled on Client but delegated computer doesn't match remote computer's name"{
-            $username = "nwtraders\administrator" 
-            $password = "mypassword" | ConvertTo-SecureString -asPlainText -Force
-            $TestCred = New-Object System.Management.Automation.PSCredential($username,$password)
-            #Client CredSSP enabled
-            Mock -CommandName Get-WSManCredSSP -MockWith {return "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER2`nThis computer is not configured to receive credentials from a remote client computer."}
-            #Server CredSSP enabled, Hotfix vulnerability workaround not in place, e.g. AllowEncryptionOracle value is different to 2
-            Mock -CommandName Get-WmiObject -MockWith {return (New-Object psobject -Property @{"Version"="10.0.17134"; "AllowEncryptionOracle"= 0})}
-            Mock -CommandName Invoke-Command -MockWith {return "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1
-            This computer is configured to receive credentials from a remote client computer."}
-            #Return hotfix not relevant to CredSSP vulnerability
-            Mock -CommandName Get-MSHotfix -MockWith {Return (New-Object psobject -Property @{"HotFixID"="KB12345678"})}
-            
-            It "Returns LocalCredSSPEnabled as $false" {
-                $result = Get-DorcCredSSPStatus -ComputerName Server1 -Credential $TestCred
+        Context "Credential Delegation enabled on Client but delegated computer doesn't match remote computer's name" {
+            BeforeAll {
+                $script:TestCred = New-Object System.Management.Automation.PSCredential(
+                    'nwtraders\administrator',
+                    ('mypassword' | ConvertTo-SecureString -AsPlainText -Force))
+
+                Mock -ModuleName DOrcDeployModule Test-IsRunningAsAdministrator { return $true }
+
+                Mock -ModuleName DOrcDeployModule Get-WSManCredSSP {
+                    "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER2`nThis computer is not configured to receive credentials from a remote client computer."
+                }
+                Mock -ModuleName DOrcDeployModule Get-WmiObject {
+                    New-Object psobject -Property @{ Version = '10.0.17134'; AllowEncryptionOracle = 0 }
+                }
+                Mock -ModuleName DOrcDeployModule Invoke-Command {
+                    "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is configured to receive credentials from a remote client computer."
+                }
+                Mock -ModuleName DOrcDeployModule Get-MSHotfix {
+                    New-Object psobject -Property @{ HotFixID = 'KB12345678' }
+                }
+            }
+
+            It "Returns LocalCredSSPEnabled as False (delegated computer mismatch)" {
+                $result = Get-DorcCredSSPStatus -ComputerName Server1 -Credential $script:TestCred
                 $result.LocalCredSSPEnabled | Should -Be $false
             }
         }
-        Context "Credential Delegation not enabled on Server"{
-            $username = "nwtraders\administrator" 
-            $password = "mypassword" | ConvertTo-SecureString -asPlainText -Force
-            $TestCred = New-Object System.Management.Automation.PSCredential($username,$password)
-            #Client CredSSP enabled
-            Mock -CommandName Get-WSManCredSSP -MockWith {return "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is not configured to receive credentials from a remote client computer."}
-            #Server CredSSP enabled, Hotfix vulnerability workaround not in place, e.g. AllowEncryptionOracle value is different to 2
-            Mock -CommandName  Get-WmiObject -MockWith {return (New-Object psobject -Property @{"Version"="10.0.17134"; "AllowEncryptionOracle"= 0})}
-            Mock -CommandName Invoke-Command -MockWith {return "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is not configured to receive credentials from a remote client computer."}
-            #Return hotfix not relevant to CredSSP vulnerability
-            Mock -CommandName Get-MSHotfix -MockWith {Return (New-Object psobject -Property @{"HotFixID"="KB12345678"})}
-            
-            It "Returns an object with all the expected properties" {
-                $result = Get-DorcCredSSPStatus -ComputerName Server1 -Credential $TestCred
+
+        Context "Credential Delegation not enabled on Server" {
+            BeforeAll {
+                $script:TestCred = New-Object System.Management.Automation.PSCredential(
+                    'nwtraders\administrator',
+                    ('mypassword' | ConvertTo-SecureString -AsPlainText -Force))
+
+                Mock -ModuleName DOrcDeployModule Test-IsRunningAsAdministrator { return $true }
+
+                Mock -ModuleName DOrcDeployModule Get-WSManCredSSP {
+                    "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is not configured to receive credentials from a remote client computer."
+                }
+                Mock -ModuleName DOrcDeployModule Get-WmiObject {
+                    New-Object psobject -Property @{ Version = '10.0.17134'; AllowEncryptionOracle = 0 }
+                }
+                Mock -ModuleName DOrcDeployModule Invoke-Command {
+                    "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is not configured to receive credentials from a remote client computer."
+                }
+                Mock -ModuleName DOrcDeployModule Get-MSHotfix {
+                    New-Object psobject -Property @{ HotFixID = 'KB12345678' }
+                }
+            }
+
+            It "Returns RemoteCredSSPEnabled as False" {
+                $result = Get-DorcCredSSPStatus -ComputerName Server1 -Credential $script:TestCred
                 $result.RemoteCredSSPEnabled | Should -Be $false
             }
         }
     }
-    Context "Computer not reachable"{ 
-        $username = "nwtraders\administrator" 
-        $password = "mypassword" | ConvertTo-SecureString -asPlainText -Force
-        $TestCred = New-Object System.Management.Automation.PSCredential($username,$password)
-        Mock -CommandName Get-WmiObject -MockWith {return (New-Object psobject -Property @{"Version"="10.0.17134"; "AllowEncryptionOracle"= 0})}
+
+    Context "Computer not reachable" {
+        BeforeAll {
+            $script:TestCred = New-Object System.Management.Automation.PSCredential(
+                'nwtraders\administrator',
+                ('mypassword' | ConvertTo-SecureString -AsPlainText -Force))
+
+            Mock -ModuleName DOrcDeployModule Test-IsRunningAsAdministrator { return $true }
+            Mock -ModuleName DOrcDeployModule Get-WSManCredSSP {
+                "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is not configured to receive credentials from a remote client computer."
+            }
+            Mock -ModuleName DOrcDeployModule Get-ServerOSVersion { '10.0.17134' }
+            Mock -ModuleName DOrcDeployModule Invoke-Command {
+                throw [System.Management.Automation.RemoteException]::new('Connection refused')
+            }
+        }
+
         It "Fails" {
-            {Get-DorcCredSSPStatus -ComputerName Server1 -Credential $TestCred} | should -Throw "Failed to connect"
+            { Get-DorcCredSSPStatus -ComputerName Server1 -Credential $script:TestCred } | Should -Throw "*Failed to connect*"
         }
     }
 }
 
 Describe "Enable-DorcCredSSP tests" {
     Context "Computer reachable" {
+
         Context "Already enabled" {
-            $username = "nwtraders\administrator" 
-            $password = "mypassword" | ConvertTo-SecureString -asPlainText -Force
-            $TestCred = New-Object System.Management.Automation.PSCredential($username,$password)
-            Mock -CommandName Get-DorcCredSSPStatus -MockWith {return ((New-Object psobject -Property `
-                @{
-                    "LocalComputerName"             = $Env:COMPUTERNAME
-                    "RemoteComputerName"            = "SERVER1"
-                    "LocalOS"                       = "10.0.17134"
-                    "RemoteOS"                      = "10.0.14393"
-                    "LocalCredSSPEnabled"           = "True"
-                    "RemoteCredSSPEnabled"          = "True"
-                    "LocalPatchInstalled"           = "False"
-                    "RemotePatchInstalled"          = "False"
-                    "LocalHotFixWorkaroundInPlace"  = "False"
-                    "RemoteHotFixWorkaroundInPlace" = "False"
-                    "CredSSPWorks"                  = "True"
-                }))}
-            It "Nothing to do" {
-                $result = Enable-DorcCredSSP -ComputerName SERVER1 -Credential $TestCred
-                $result | Should -Be "[INFO] CredSSP has already been enabled between [$Env:COMPUTERNAME] and [SERVER1]"
+            BeforeAll {
+                $script:TestCred = New-Object System.Management.Automation.PSCredential(
+                    'nwtraders\administrator',
+                    ('mypassword' | ConvertTo-SecureString -AsPlainText -Force))
+
+                Mock -ModuleName DOrcDeployModule Test-IsRunningAsAdministrator { return $true }
+
+                Mock -ModuleName DOrcDeployModule Get-DorcCredSSPStatus {
+                    New-Object psobject -Property @{
+                        LocalComputerName             = $Env:COMPUTERNAME
+                        RemoteComputerName            = "SERVER1"
+                        LocalOS                       = "10.0.17134"
+                        RemoteOS                      = "10.0.14393"
+                        LocalCredSSPEnabled           = "True"
+                        RemoteCredSSPEnabled          = "True"
+                        LocalPatchInstalled           = "False"
+                        RemotePatchInstalled          = "False"
+                        LocalHotFixWorkaroundInPlace  = "False"
+                        RemoteHotFixWorkaroundInPlace = "False"
+                        CredSSPWorks                  = "True"
+                    }
+                }
             }
 
+            It "Nothing to do" {
+                $result = Enable-DorcCredSSP -ComputerName SERVER1 -Credential $script:TestCred
+                $result | Should -Be "[INFO] CredSSP has already been enabled between [$Env:COMPUTERNAME] and [SERVER1]"
+            }
         }
-        Context "Not yet enabled" {
-            Context "Return $false and then $true for CredSSPWorks property with each execution of Get-DorcCredSSPStatus"{
-                $username = "nwtraders\administrator" 
-                $password = "mypassword" | ConvertTo-SecureString -asPlainText -Force
-                $TestCred = New-Object System.Management.Automation.PSCredential($username,$password)
-                #.CredSSPWorks needs to first return $false and then $true. This little loop allows for this.
+
+        Context "Not yet enabled - Get-DorcCredSSPStatus returns False then True across successive calls" {
+            BeforeAll {
+                $script:TestCred = New-Object System.Management.Automation.PSCredential(
+                    'nwtraders\administrator',
+                    ('mypassword' | ConvertTo-SecureString -AsPlainText -Force))
+
+                Mock -ModuleName DOrcDeployModule Test-IsRunningAsAdministrator { return $true }
+                Mock -ModuleName DOrcDeployModule Enable-WSManCredSSP { }
+
                 $script:mockCalled = 0
-                $MockDorcCredSSPStatus = {
+                Mock -ModuleName DOrcDeployModule Get-DorcCredSSPStatus {
                     $script:mockCalled++
-                    if ($script:mockCalled %2 -eq 1) { #each odd run is $false 
-                        return ((New-Object psobject -Property `
-                            @{
-                                "LocalComputerName"             = $Env:COMPUTERNAME
-                                "RemoteComputerName"            = "SERVER1"
-                                "LocalOS"                       = "10.0.17134"
-                                "RemoteOS"                      = "10.0.14393"
-                                "LocalCredSSPEnabled"           = "False"
-                                "RemoteCredSSPEnabled"          = "False"
-                                "LocalPatchInstalled"           = "False"
-                                "RemotePatchInstalled"          = "False"
-                                "LocalHotFixWorkaroundInPlace"  = "False"
-                                "RemoteHotFixWorkaroundInPlace" = "False"
-                                "CredSSPWorks"                  = "False"
-                            }))
+                    if ($script:mockCalled % 2 -eq 1) {
+                        return (New-Object psobject -Property @{
+                            LocalComputerName             = $Env:COMPUTERNAME
+                            RemoteComputerName            = "SERVER1"
+                            LocalOS                       = "10.0.17134"
+                            RemoteOS                      = "10.0.14393"
+                            LocalCredSSPEnabled           = "False"
+                            RemoteCredSSPEnabled          = "False"
+                            LocalPatchInstalled           = "False"
+                            RemotePatchInstalled          = "False"
+                            LocalHotFixWorkaroundInPlace  = "False"
+                            RemoteHotFixWorkaroundInPlace = "False"
+                            CredSSPWorks                  = "False"
+                        })
                     }
-                    else {
-                        return ((New-Object psobject -Property `
-                            @{
-                                "LocalComputerName"             = $Env:COMPUTERNAME
-                                "RemoteComputerName"            = "SERVER1"
-                                "LocalOS"                       = "10.0.17134"
-                                "RemoteOS"                      = "10.0.14393"
-                                "LocalCredSSPEnabled"           = "True"
-                                "RemoteCredSSPEnabled"          = "True"
-                                "LocalPatchInstalled"           = "True"
-                                "RemotePatchInstalled"          = "True"
-                                "LocalHotFixWorkaroundInPlace"  = "True"
-                                "RemoteHotFixWorkaroundInPlace" = "True"
-                                "CredSSPWorks"                  = "True"
-                            }))
-                    }
-                    
+                    return (New-Object psobject -Property @{
+                        LocalComputerName             = $Env:COMPUTERNAME
+                        RemoteComputerName            = "SERVER1"
+                        LocalOS                       = "10.0.17134"
+                        RemoteOS                      = "10.0.14393"
+                        LocalCredSSPEnabled           = "True"
+                        RemoteCredSSPEnabled          = "True"
+                        LocalPatchInstalled           = "True"
+                        RemotePatchInstalled          = "True"
+                        LocalHotFixWorkaroundInPlace  = "True"
+                        RemoteHotFixWorkaroundInPlace = "True"
+                        CredSSPWorks                  = "True"
+                    })
                 }
-                Mock -CommandName Invoke-Command -MockWith {return "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1
-                This computer is configured to receive credentials from a remote client computer."}
-                Mock -CommandName Get-DorcCredSSPStatus -MockWith $MockDorcCredSSPStatus
-                Mock -CommandName Get-MSHotfix -MockWith {Return (New-Object psobject -Property @{"HotFixID"="KB12345678"})}
-                It "Enables CredSSP successfully" {
-                    $result = Enable-DorcCredSSP -ComputerName SERVER1 -Credential $TestCred
-                    $result | Should -Be "CredSSP Successfully enabled between [$ENV:ComputerName] and [SERVER1]"
+                Mock -ModuleName DOrcDeployModule Invoke-Command `
+                    -ParameterFilter { $ScriptBlock -and $ScriptBlock.ToString() -match 'Enable-WSManCredSSP' } `
+                    -MockWith { }  # emit nothing — real Enable-WSManCredSSP returns no output
+                Mock -ModuleName DOrcDeployModule Invoke-Command {
+                    "The machine is configured to allow delegating fresh credentials to the following target(s): SERVER1`nThis computer is configured to receive credentials from a remote client computer."
                 }
+                Mock -ModuleName DOrcDeployModule Get-MSHotfix {
+                    New-Object psobject -Property @{ HotFixID = 'KB12345678' }
+                }
+            }
+
+            It "Enables CredSSP successfully" {
+                $result = Enable-DorcCredSSP -ComputerName SERVER1 -Credential $script:TestCred
+                $result | Should -Be "[INFO] CredSSP Successfully enabled between [$Env:COMPUTERNAME] and [SERVER1]"
             }
         }
     }
+
     Context "Computer not reachable" {
-        $username = "nwtraders\administrator" 
-        $password = "mypassword" | ConvertTo-SecureString -asPlainText -Force
-        $TestCred = New-Object System.Management.Automation.PSCredential($username,$password)
-        Mock Get-DorcCredSSPStatus {return ((New-Object psobject -Property `
-            @{
-                "LocalComputerName"             = $Env:COMPUTERNAME
-                "RemoteComputerName"            = "SERVER1"
-                "LocalOS"                       = "10.0.17134"
-                "RemoteOS"                      = "10.0.14393"
-                "LocalCredSSPEnabled"           = "True"
-                "RemoteCredSSPEnabled"          = "False"
-                "LocalPatchInstalled"           = "False"
-                "RemotePatchInstalled"          = "False"
-                "LocalHotFixWorkaroundInPlace"  = "False"
-                "RemoteHotFixWorkaroundInPlace" = "False"
-                "CredSSPWorks"                  = "False"
-            }))}
+        BeforeAll {
+            $script:TestCred = New-Object System.Management.Automation.PSCredential(
+                'nwtraders\administrator',
+                ('mypassword' | ConvertTo-SecureString -AsPlainText -Force))
+
+            Mock -ModuleName DOrcDeployModule Test-IsRunningAsAdministrator { return $true }
+            Mock -ModuleName DOrcDeployModule Get-DorcCredSSPStatus {
+                New-Object psobject -Property @{
+                    LocalComputerName             = $Env:COMPUTERNAME
+                    RemoteComputerName            = "SERVER1"
+                    LocalOS                       = "10.0.17134"
+                    RemoteOS                      = "10.0.14393"
+                    LocalCredSSPEnabled           = "True"
+                    RemoteCredSSPEnabled          = "False"
+                    LocalPatchInstalled           = "False"
+                    RemotePatchInstalled          = "False"
+                    LocalHotFixWorkaroundInPlace  = "False"
+                    RemoteHotFixWorkaroundInPlace = "False"
+                    CredSSPWorks                  = "False"
+                }
+            }
+        }
+
         It "Throws" {
-            {Enable-DorcCredSSP -ComputerName nonexistentcomputer -Credential $TestCred } | Should -Throw 'Failed'
+            { Enable-DorcCredSSP -ComputerName nonexistentcomputer -Credential $script:TestCred } |
+                Should -Throw '*Failed*'
         }
     }
 }
