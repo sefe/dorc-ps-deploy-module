@@ -25,6 +25,7 @@ Describe "Apply-DatabasePermissions integration" {
     }
 
     BeforeEach {
+        $script:PermissionCallOrder = [System.Collections.Generic.List[string]]::new()
         InModuleScope DOrcDeployModule {
             $script:IsProd = $false
             $script:EnvironmentName = 'BB Labs 01'
@@ -43,11 +44,18 @@ Describe "Apply-DatabasePermissions integration" {
         }
         Mock -ModuleName DOrcDeployModule GetDBStatus { 'Normal' }
         Mock -ModuleName DOrcDeployModule GetDateReverse { 'test-date' }
-        Mock -ModuleName DOrcDeployModule Get-DBPermissions { }
+        Mock -ModuleName DOrcDeployModule Get-DBPermissions {
+            $script:PermissionCallOrder.Add('backup')
+        }
         Mock -ModuleName DOrcDeployModule Test-Path { $true }
         Mock -ModuleName DOrcDeployModule Get-ChildItem { [pscustomobject]@{ Name = 'permissions.sql' } }
-        Mock -ModuleName DOrcDeployModule Invoke-Sqlcmd { }
-        Mock -ModuleName DOrcDeployModule Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+        Mock -ModuleName DOrcDeployModule Invoke-Sqlcmd {
+            $script:PermissionCallOrder.Add('bootstrap')
+        }
+        Mock -ModuleName DOrcDeployModule Start-Process {
+            $script:PermissionCallOrder.Add('api')
+            [pscustomobject]@{ ExitCode = 0 }
+        }
     }
 
     It "keeps existing callers on legacy mode and checks the process result" {
@@ -120,13 +128,14 @@ Describe "Apply-DatabasePermissions integration" {
         }
         Should -Invoke -ModuleName DOrcDeployModule Get-DBPermissions -Times 1 -Exactly
         Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 1 -Exactly
+        $script:PermissionCallOrder | Should -Be @('backup', 'bootstrap', 'api')
     }
 
     It "requires the API SQL identity before a DatabaseAccess apply" {
         InModuleScope DOrcDeployModule { $script:DatabaseAccessSqlIdentity = $null }
 
         { Apply-DatabasePermissions 'SQL' 'App' -permissionSource DatabaseAccess } |
-            Should -Throw '*DatabaseAccessSqlIdentity must be configured*'
+            Should -Throw '*DatabaseAccessSqlIdentity must be configured for a DatabaseAccess apply*'
 
         Should -Invoke -ModuleName DOrcDeployModule Get-DBPermissions -Times 1 -Exactly
         Should -Invoke -ModuleName DOrcDeployModule Start-Process -Times 0 -Exactly

@@ -3120,7 +3120,7 @@ function Initialize-DatabaseAccessSqlIdentity
 )
 {
     if ([string]::IsNullOrWhiteSpace($identity)) {
-        throw "DatabaseAccessSqlIdentity must be configured when DatabasePermissionsMode is DatabaseAccess."
+        throw "DatabaseAccessSqlIdentity must be configured for a DatabaseAccess apply."
     }
 
     $quotedIdentity = $identity.Replace("]", "]]")
