@@ -3112,6 +3112,41 @@ function Install-WindowsFeaturesDorc
     }
 }
 
+function Initialize-DatabaseAccessSqlIdentity
+(
+    [Parameter(Position = 0, Mandatory = $true)] [string] $instance,
+    [Parameter(Position = 1, Mandatory = $true)] [string] $database,
+    [string] $identity = $DatabaseAccessSqlIdentity
+)
+{
+    if ([string]::IsNullOrWhiteSpace($identity)) {
+        throw "DatabaseAccessSqlIdentity must be configured for a DatabaseAccess apply."
+    }
+
+    $quotedIdentity = $identity.Replace("]", "]]")
+    $literalIdentity = $identity.Replace("'", "''")
+    $quotedDatabase = $database.Replace("]", "]]")
+    $query = @"
+IF SUSER_ID(N'$literalIdentity') IS NULL
+    CREATE LOGIN [$quotedIdentity] FROM WINDOWS;
+GRANT VIEW ANY DEFINITION TO [$quotedIdentity];
+USE [$quotedDatabase];
+IF DATABASE_PRINCIPAL_ID(N'$literalIdentity') IS NULL
+    CREATE USER [$quotedIdentity] FOR LOGIN [$quotedIdentity];
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.database_role_members
+    WHERE role_principal_id = DATABASE_PRINCIPAL_ID(N'db_owner')
+        AND member_principal_id = DATABASE_PRINCIPAL_ID(N'$literalIdentity')
+)
+    ALTER ROLE [db_owner] ADD MEMBER [$quotedIdentity];
+"@
+
+    Write-Host "[DatabaseAccess] Ensuring API SQL permissions on $instance.$database"
+    Invoke-Sqlcmd -TrustServerCertificate -ServerInstance $instance -Query $query `
+        -QueryTimeout 600 -ErrorAction Stop
+}
+
 function Apply-DatabasePermissions 
 (
     [Parameter(Position = 0, Mandatory = $true)] [string] $instance,
@@ -3156,6 +3191,9 @@ function Apply-DatabasePermissions
         if (-not (Test-Path -LiteralPath $outputFolder -PathType Container) -or
             @(Get-ChildItem -LiteralPath $outputFolder -Recurse -File -Filter '*.sql' -ErrorAction Stop).Count -eq 0) {
             throw "Permissions extract failed for $instance.$database; permissions were not applied."
+        }
+        if ($permissionSource -eq 'DatabaseAccess') {
+            Initialize-DatabaseAccessSqlIdentity -instance $instance -database $database
         }
     }
 
