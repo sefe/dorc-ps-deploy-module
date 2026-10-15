@@ -74,6 +74,16 @@ function Invoke-CommandWithRetry {
         }
     }
 }
+
+# Falls back to the pre-rename API field (Type / ApplicationTags) for older DOrc API versions.
+function Get-RefDataTags {
+    param(
+        [Parameter(Mandatory = $true)] $Item,
+        [Parameter(Mandatory = $true)] [string] $LegacyProperty
+    )
+    $value = if ($Item.PSObject.Properties['Tags']) { $Item.Tags } else { $Item.$LegacyProperty }
+    return @($value | ForEach-Object { "$_".Split(';') } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
 #endregion
 
 
@@ -617,7 +627,7 @@ function GetDbInfoByTypeForEnv([string] $strEnvironment, [string] $strType) {
     $EnvId=(Invoke-RestMethod -Uri $uri -method Get -Headers $DorcAPIHeaders -ContentType 'application/json').EnvironmentId
     $uri=$RefDataApiUrl + 'RefDataEnvironmentsDetails/' + $EnvId
     $table=Invoke-RestMethod -Uri $uri -method Get -Headers $DorcAPIHeaders -ContentType 'application/json'
-    $table=$table.DbServers | Where-Object {$_.Type -eq $strType} | Select-Object Name, ServerName
+    $table=$table.DbServers | Where-Object {(Get-RefDataTags $_ 'Type') -contains $strType} | Select-Object Name, ServerName
     $strResult="Invalid"
     if ($table.Name.count -eq 0) {
         Write-Host "No entries returned for $strEnvironment $strType"
@@ -1376,7 +1386,7 @@ function GetServersOfType([string] $strEnvironment, [string] $strType = "") {
         $Row.Server_ID1 = ($EnvDetailsInfo.AppServers | Where {$_.Name -eq $Server}).ServerId
         $Row.Server_Name = $server
         $Row.OS_Version = ($EnvDetailsInfo.AppServers | Where {$_.Name -eq $Server}).OsName
-        $Row.Application_Server_Name = ($EnvDetailsInfo.AppServers | Where {$_.Name -eq $Server}).ApplicationTags
+        $Row.Application_Server_Name = (Get-RefDataTags ($EnvDetailsInfo.AppServers | Where {$_.Name -eq $Server} | Select-Object -First 1) 'ApplicationTags') -join ';'
         If ($strType -and ($Row.Application_Server_Name.Split(";") -notcontains $strType) -and ($strType -ne ';') -and ($strType -ne '%')) {}
         Else {
             $table.Rows.Add($Row) 
@@ -2941,7 +2951,7 @@ function GetDbInfoByTypeForEnvWithArray([string] $strEnvironment, [string] $strT
     $uri=$RefDataApiUrl + 'RefDataEnvironmentsDetails/' + $EnvId
 	write-host "EnvironmentDetails Uri is:" $uri
     $table=Invoke-RestMethod -Uri $uri -method Get -Headers $DorcAPIHeaders -ContentType 'application/json'
-    $table=$table.DbServers | where {$_.Type -eq $strType} | Select Name, ServerName, ArrayName
+    $table=$table.DbServers | where {(Get-RefDataTags $_ 'Type') -contains $strType} | Select Name, ServerName, ArrayName
     $strResult="Invalid"
     if ($table.Name.count -eq 0) {
         Write-Host "No entries returned for" $strEnvironment $strType 
