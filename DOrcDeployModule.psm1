@@ -4493,7 +4493,7 @@ function DeployDACPACToAzureSQL {
 
 function Get-DorcToken {   
     $DorcIDSsecret =  $DorcCliSecret
-	
+	$ProgressPreference = "SilentlyContinue"
     if ([string]::IsNullOrWhiteSpace($DorcIDSsecret)) {
         Write-Error "The DorcIDSsecret is empty or null. Please provide a valid value."
         return $null
